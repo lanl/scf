@@ -18,12 +18,15 @@ We train the 2D models with a single GPU (NVIDIA RTX 3090). However, to train th
 
 
 # Use
+
+To train the 2D models, 
+
 ```
 cd scf2
 bash run_train.sh
 ```
 
-or
+To train the 3D models,
 
 ```
 cd scf3
