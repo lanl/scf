@@ -14,7 +14,7 @@ The work is under LANL open source approval reference O4809.
 
 The data generation depends on [RGM](https://github.com/lanl/rgm). `RGM` depends on [FLIT](https://github.com/lanl/flit).
 
-We train the 2D models with a single GPU (NVIDIA RTX 3090). However, to train the 3D models, you will need supercomputing-grade GPUs (NVIDIA A100) with at least 80GB memory.
+We train the 2D models with a single GPU (NVIDIA RTX 3090). However, to train the 3D models, you will need multiple supercomputing-grade GPUs (e.g., NVIDIA A100), each with more than 40GB memory.
 
 
 # Use
