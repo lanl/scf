@@ -10,9 +10,9 @@ The work was supported by Los Alamos National Laboratory (LANL) Laboratory Direc
 The work is under LANL open source approval reference O4809.
 
 # Requirement
-`SCF` is written with Python, PyTorch, and PyTorch Lightning. Please install these package first. Other than that, `SCF` is self-consistent.
+`SCF` is written with Python, PyTorch, and PyTorch Lightning. Please install these package first.
 
-The data generation depends on [RGM](https://github.com/lanl/rgm). `RGM` depends on [FLIT](https://github.com/lanl/flit).
+The data generation depends on [RGM](https://github.com/lanl/rgm), which depends on [FLIT](https://github.com/lanl/flit).
 
 We train the 2D models with a single GPU (NVIDIA RTX 3090). However, to train the 3D models, you will need multiple supercomputing-grade GPUs (e.g., NVIDIA A100), each with more than 40GB memory.
 
