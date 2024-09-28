@@ -58,4 +58,4 @@ We welcome feedbacks, bug reports, and improvement ideas on `SCF`.
 If you use this package in your research and find it useful, please cite it as
 
 * Kai Gao, Ting Chen, 2024, SCF: Seismicity-Constrained Fault Detection and Characterization, url: [github.com/lanl/scf](https://github.com/lanl/scf)
-* Kai Gao, Ting Chen, 2024, Seismicity-constrained fault detection and characterization with a multitask machine learning model, submitted.
+* Kai Gao, Ting Chen, 2024, Seismicity-constrained fault detection and characterization with a multitask machine learning model, under review, doi: [10.31223/X5NM6S](https://doi.org/10.31223/X5NM6S).
