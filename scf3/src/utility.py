@@ -1,20 +1,20 @@
 #
 # © 2024. Triad National Security, LLC. All rights reserved.
 #
-# This program was produced under U.S. Government contract 89233218CNA000001 
-# for Los Alamos National Laboratory (LANL), which is operated by 
-# Triad National Security, LLC for the U.S. Department of Energy/National 
-# Nuclear Security Administration. All rights in the program are reserved 
+# This program was produced under U.S. Government contract 89233218CNA000001
+# for Los Alamos National Laboratory (LANL), which is operated by
+# Triad National Security, LLC for the U.S. Department of Energy/National
+# Nuclear Security Administration. All rights in the program are reserved
 # by Triad National Security, LLC, and the U.S. Department of Energy/
-# National Nuclear Security Administration. 
-# The Government is granted for itself and others acting on its behalf a nonexclusive, 
-# paid-up, irrevocable worldwide license in this material to reproduce, prepare, 
-# derivative works, distribute copies to the public, perform publicly 
+# National Nuclear Security Administration.
+# The Government is granted for itself and others acting on its behalf a nonexclusive,
+# paid-up, irrevocable worldwide license in this material to reproduce, prepare,
+# derivative works, distribute copies to the public, perform publicly
 # and display publicly, and to permit others to do so.
 #
 # Author:
 #   Kai Gao, kaigao@lanl.gov
-# 
+#
 
 
 import numpy as np
@@ -91,3 +91,42 @@ def date_time():
 
     now = datetime.now()
     return now.strftime(" %Y/%m/%d %H:%M:%S ")
+
+
+## Roll over a block by overlapping
+def rollover_block(n, b, p):
+
+    start = []
+    end = []
+    ibeg = 1
+    iend = b
+    start.append(ibeg)
+    end.append(iend)
+    nb = 1
+
+    if iend >= n:
+        end[0] = n
+    else:
+        while ibeg <= n:
+
+            ibeg = ibeg + b - p
+            iend = iend + b - p
+
+            stop = False
+            if iend >= n:
+                iend = n
+                ibeg = iend - b + 1
+                stop = True
+
+            start.append(ibeg)
+            end.append(iend)
+            nb = nb + 1
+
+            if stop:
+                break
+
+    for i in range(nb):
+        start[i] = start[i] - 1
+        end[i] = end[i] - 1
+
+    return nb, start, end
