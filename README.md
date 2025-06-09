@@ -10,30 +10,30 @@ The work was supported by Los Alamos National Laboratory (LANL) Laboratory Direc
 The work is under LANL open source approval reference O4809.
 
 # Requirement
-`SCF` is written with Python, PyTorch, and PyTorch Lightning. Please install these package first.
+`SCF` requires PyTorch and PyTorch Lightning. For plotting, it requires matplotlib and PyVista.
 
 The data generation depends on [RGM](https://github.com/lanl/rgm), which depends on [FLIT](https://github.com/lanl/flit).
 
-We train the 2D models with a single GPU (NVIDIA RTX 3090). However, to train the 3D models, you will need multiple supercomputing-grade GPUs (e.g., NVIDIA A100), each with more than 40GB memory.
+We train the models with NVIDIA A100 GPUs.
 
 
 # Use
 
-To train the 2D models, 
+To train and validate the 2D models,
 
 ```
-cd scf2
+cd 2d
 bash run_train.sh
 ```
 
-To train the 3D models,
+To train and validate the 3D models,
 
 ```
-cd scf3
+cd 3d
 bash run_train.sh
 ```
 
-The `test` directories in `scf2` and `scf3` contain examples. 
+The `test` directories in `2d` and `3d` contain field data examples.
 
 # License
 &copy; 2024. Triad National Security, LLC. All rights reserved.
