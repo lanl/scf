@@ -5,7 +5,7 @@
 
 Fault detection is one of center challenges in subsurface imaging and characterization. We develop a seismicity-constrained fault detection and characterization based on a multitask machine learning model to leverage both seismic migration image and seismicity location information. The repository contains codes associated with the ML models and the codes for generating training data.
 
-The work was supported by Los Alamos National Laboratory (LANL) Laboratory Directory Research and Development (LDRD) project 20240322ER. LANL is operated by Triad National Security, LLC, for the National Nuclear Security Administration (NNSA) of the U.S. Department of Energy (DOE) under Contract No. 89233218CNA000001. The research used high-performance computing resources provided by LANL's Institutional Computing program.
+The work was supported by Los Alamos National Laboratory (LANL) Laboratory Directed Research and Development (LDRD) project 20240322ER. LANL is operated by Triad National Security, LLC, for the National Nuclear Security Administration (NNSA) of the U.S. Department of Energy (DOE) under Contract No. 89233218CNA000001. The research used high-performance computing resources provided by LANL's Institutional Computing program.
 
 The work is under LANL open source approval reference O4809.
 
