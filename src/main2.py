@@ -1,5 +1,5 @@
 #
-# (c) 2025. Triad National Security, LLC. All rights reserved.
+# (c) 2025-2026. Triad National Security, LLC. All rights reserved.
 #
 # This program was produced under U.S. Government contract 89233218CNA000001
 # for Los Alamos National Laboratory (LANL), which is operated by
@@ -8,826 +8,525 @@
 # by Triad National Security, LLC, and the U.S. Department of Energy/
 # National Nuclear Security Administration.
 # The Government is granted for itself and others acting on its behalf a nonexclusive,
-# paid-up, irrevocable worldwide license in this material to reproduce, prepare,
+# paid-up, irrevocable worldwide license in this material to reproduce, prepare
 # derivative works, distribute copies to the public, perform publicly
 # and display publicly, and to permit others to do so.
 #
 # Author:
 #   Kai Gao, kaigao@lanl.gov
 #
+# SCF-Net in 2D: one network detects faults and their dip from a seismic image and a seismicity location image,
+# from the image only, or from the seismicity only.
+#   training:   python main2.py [options]
+#   validation: python main2.py --check=<checkpoint> [options]
+#   inference:  python main2.py --model=<checkpoint> --input=<image> --input_meq=<seismicity> --output=<prefix> [options]
+#
 
 import warnings
 import argparse
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.ticker import MultipleLocator
-from tqdm import tqdm
-import sys
-import os
+import json
 import math
+import os
+import sys
+
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+from tqdm import tqdm
 
 import torch
-import torch.nn.functional as F
+import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from torch.optim import Adam
 from torch.optim.lr_scheduler import LambdaLR
 
 import lightning as pl
-from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 from lightning.pytorch.loggers import TensorBoardLogger
-from lightning.pytorch.callbacks import LearningRateMonitor
-from torchmetrics.functional.image import structural_similarity_index_measure as ssim
-import torchmetrics.functional as mf
 
-warnings.filterwarnings("ignore")
+warnings.filterwarnings('ignore')
 
-current_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(current_dir)
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-# parent_dir = os.path.abspath(os.path.join(current_dir, ".."))
-# sys.path.append(parent_dir)
+from utility import read_array, write_array, set_random_seed, get_numpy, date_time, set_font
+from scf_common import (estimate_scale, agc, apply_mode, CropCollate, random_subcrop, dice_loss, bce_loss, kl_loss,
+                        masked_l1, dilate, fault_scores, predict_blocks)
+from seismicity import render_seismicity
+from model2 import resu1, resu2, resu3, maxpool, LocalSpatialChannelAttention, mtl_decoder_fusion, mtl_subdecoder
 
-from utility import *
-from model2 import *
-
-#==============================================================================
-parser = argparse.ArgumentParser(description='Options')
-parser.add_argument('--ntrain', type=int, default=1000, help='training size')
-parser.add_argument('--nvalid', type=int, default=100, help='validation size')
-parser.add_argument('--batch_train', type=int, default=1, help='training batch size')
-parser.add_argument('--batch_valid', type=int, default=1, help='validation batch size')
-parser.add_argument('--warmup', type=int, default=10, help='warmup epochs')
-parser.add_argument('--epochs', type=int, default=100, help='max number of epochs')
-parser.add_argument('--lr', type=float, default=0.5e-4, help='learning rate')
-parser.add_argument('--threads', type=int, default=8, help='number of threads for data loader')
-parser.add_argument('--dir_output', type=str, default='./result', help='directory')
-parser.add_argument('--dir_data_train', type=str, default='./dataset/data_train', help='directory')
-parser.add_argument('--dir_target_train', type=str, default='./dataset/target_train', help='directory')
-parser.add_argument('--dir_data_valid', type=str, default='./dataset/data_valid', help='directory')
-parser.add_argument('--dir_target_valid', type=str, default='./dataset/target_valid', help='directory')
-parser.add_argument('--resume', type=str, default=None, help='restart training from resume checkopoint')
+# ==============================================================================
+parser = argparse.ArgumentParser(description='SCF-Net 2D: training (default), validation (--check) and inference (--model)')
+# Data
+parser.add_argument('--n1', type=int, default=256, help='number of samples along x1 (depth)')
+parser.add_argument('--n2', type=int, default=256, help='number of samples along x2')
+parser.add_argument('--ntrain', type=int, default=2000, help='number of training samples')
+parser.add_argument('--nvalid', type=int, default=200, help='number of validation samples')
+parser.add_argument('--dir_data_train', type=str, default='./dataset/data_train', help='directory of the training inputs')
+parser.add_argument('--dir_target_train', type=str, default='./dataset/target_train', help='directory of the training labels')
+parser.add_argument('--dir_data_valid', type=str, default='./dataset/data_valid', help='directory of the validation inputs')
+parser.add_argument('--dir_target_valid', type=str, default='./dataset/target_valid', help='directory of the validation labels')
+parser.add_argument('--dir_output', type=str, default='./result', help='directory of the checkpoints, logs and validation results')
+# Training
+parser.add_argument('--batch_train', type=int, default=8, help='training batch size per GPU')
+parser.add_argument('--batch_valid', type=int, default=8, help='validation batch size per GPU')
+parser.add_argument('--epochs', type=int, default=60, help='number of epochs')
+parser.add_argument('--warmup', type=int, default=5, help='number of epochs of linear learning-rate warmup')
+parser.add_argument('--lr', type=float, default=2.0e-4, help='learning rate after the warmup, with a cosine decay')
+parser.add_argument('--bn_freeze', type=int, default=6, help='number of final epochs with fixed batch-normalization statistics')
+parser.add_argument('--threads', type=int, default=8, help='number of data-loader workers per GPU')
+parser.add_argument('--precision', type=str, default='32', help='32, bf16-mixed or 16-mixed')
+parser.add_argument('--seed', type=int, default=12345, help='random seed')
+parser.add_argument('--resume', type=str, default=None, help='checkpoint to resume the training from')
+parser.add_argument('--finetune', type=str, default=None, help='checkpoint that initializes the network (fine tuning)')
 parser.add_argument('--nodes', type=int, default=1, help='number of nodes')
-parser.add_argument('--gpus_per_node', type=int, default=4, help='number of gpus per node')
-parser.add_argument('--seed', type=int, default=12345, help='random seed for initialization')
-parser.add_argument('--check', type=str, default=None, help='name of the checkpoint')
-parser.add_argument('--n1', '-n1', type=int, default=256, help='number of sampling points in x1')
-parser.add_argument('--n2', '-n2', type=int, default=256, help='number of sampling points in x2')
-parser.add_argument('--input', '-in', type=str, default=None, help='name of the input')
-parser.add_argument('--model', '-model', type=str, default=None, help='name of the trained model')
-parser.add_argument('--output', '-out', type=str, default=None, help='name of the output')
-parser.add_argument('--finetune', type=str, default=None, help='name of the pre-trained model for fine tuning')
-parser.add_argument('--b1', '-b1', type=int, default=None, help='inference phase block size in x1')
-parser.add_argument('--b2', '-b2', type=int, default=None, help='inference phase block size in x2')
-parser.add_argument('--p1', '-p1', type=int, default=32, help='inference phase block overlapping in x1')
-parser.add_argument('--p2', '-p2', type=int, default=64, help='inference phase block overlapping in x2')
-parser.add_argument('--pp', '-pp', type=str2bool, default='y', help='input PP image')
-parser.add_argument('--ps', '-ps', type=str2bool, default='y', help='input PS image')
-parser.add_argument('--sp', '-sp', type=str2bool, default='y', help='input SP image')
-parser.add_argument('--ss', '-ss', type=str2bool, default='y', help='input SS image')
-parser.add_argument('--net', '-net', type=str, default='scf', help='network name')
-parser.add_argument('--precision', '-precision', type=str, default='32', 
-                    help='precision of training; 16-mixed, bf16-mixed, or 32')
-parser.add_argument('--plot', '-plot', type=str2bool, default='y', help='display validation results or not')
+parser.add_argument('--gpus_per_node', type=int, default=1,
+                    help='number of GPUs per node (with --accelerator=cpu, the number of CPU processes)')
+parser.add_argument('--accelerator', type=str, default='auto', choices=['auto', 'gpu', 'cpu'],
+                    help='auto: the GPUs if there are any')
+# Training samples
+parser.add_argument('--crop1', type=int, default=128, help='smallest random crop along x1 (0: no crop)')
+parser.add_argument('--crop2', type=int, default=128, help='smallest random crop along x2 (0: no crop)')
+parser.add_argument('--p_image', type=float, default=0.3, help='probability of a training sample with the image only')
+parser.add_argument('--p_meq', type=float, default=0.2, help='probability of a training sample with the seismicity only')
+parser.add_argument('--gain', type=float, nargs=2, default=[0.5, 2.0], help='range of the random gain of the training images')
+parser.add_argument('--flip', type=float, default=0.5, help='probability of a reversed polarity of a training image')
+parser.add_argument('--meq_blur', type=float, nargs=2, default=[0.0, 1.5],
+                    help='range of the standard deviation (pixels) of the random blur of the seismicity of half of the training samples')
+# Loss
+parser.add_argument('--w_dip', type=float, default=1.0, help='weight of the dip loss')
+parser.add_argument('--w_consist', type=float, default=1.0, help='weight of the patch-consistency loss')
+# Validation
+parser.add_argument('--check', type=str, default=None, help='checkpoint to validate on the validation set')
+parser.add_argument('--tol', type=int, default=2, help='distance tolerance of the fault metrics (pixels)')
+parser.add_argument('--nplot', type=int, default=20, help='number of validation samples to plot and save')
+# Inference
+parser.add_argument('--model', type=str, default=None, help='checkpoint for inference')
+parser.add_argument('--input', type=str, default=None, help='image (raw float32, x1 fastest); zero if not given')
+parser.add_argument('--input_meq', type=str, default=None, help='seismicity location image (raw float32); zero if not given')
+parser.add_argument('--input_events', type=str, default=None,
+                    help='event locations instead of --input_meq: a text file of x1 and x2 grid coordinates (from 0)')
+parser.add_argument('--output', type=str, default=None, help='prefix of the outputs <output>[.<mode>].fsem and .fdip')
+parser.add_argument('--mode', type=str, default='all', choices=['all', 'both', 'image', 'meq'],
+                    help='input mode: image and seismicity, image only, seismicity only, or all three')
+parser.add_argument('--b1', type=int, default=0, help='block size along x1 (0: the whole axis)')
+parser.add_argument('--b2', type=int, default=0, help='block size along x2 (0: the whole axis)')
+parser.add_argument('--p1', type=int, default=64, help='block overlap along x1')
+parser.add_argument('--p2', type=int, default=64, help='block overlap along x2')
+parser.add_argument('--scale', type=str, default='rms', choices=['rms', 'agc'],
+                    help='amplitude normalization of the input image: rms of the whole image, or agc (local rms)')
+parser.add_argument('--agc_sigma', type=float, default=32.0, help='window of agc (pixels)')
 opts = parser.parse_args()
 
-# Assert meaningful dimenisons
-assert opts.n1 >= 1
-assert opts.n2 >= 1
+assert min(opts.n1, opts.n2) >= 1
+assert 0 <= opts.p_image + opts.p_meq <= 1
 
-if opts.b1 is not None:
-    assert opts.p1 < opts.b1
-if opts.b2 is not None:
-    assert opts.p2 < opts.b2
-
-# Count number of input images
-if opts.net == 'scf-elastic':
-    nc = int(opts.pp) + int(opts.ps) + int(opts.sp) + int(opts.ss)
-
-# Find device
-if torch.cuda.is_available() and opts.gpus_per_node >= 1:
-    device = torch.device('cuda')
-    print(date_time(), ' >> Using GPU')
-else:
-    device = torch.device('cpu')
-    print(date_time(), ' >> Using CPU')
-
-# Set precision
+use_gpu = opts.accelerator != 'cpu' and torch.cuda.is_available() and opts.gpus_per_node >= 1
+if opts.accelerator == 'gpu' and not use_gpu:
+    raise RuntimeError('--accelerator=gpu, but no GPU is available')
+device = torch.device('cuda' if use_gpu else 'cpu')
 torch.set_float32_matmul_precision('high')
 
+# Input modes, with the weights of their validation losses
+MODES = ['image', 'both', 'meq']
+TITLES = {'image': 'Image Only', 'both': 'Image + Seismicity', 'meq': 'Seismicity Only'}
+WEIGHTS = {'both': 1.0 - opts.p_image - opts.p_meq, 'image': opts.p_image, 'meq': opts.p_meq}
 
-#==============================================================================
+
+# ==============================================================================
 class BasicDataset(Dataset):
+    """Samples <i>_img.bin and <i>_meq.bin, and labels <i>_fsem.bin, _fdip.bin and _fsem_meq.bin."""
 
-    def __init__(self, dir_data, dir_target, data_ids, dim=(opts.n1, opts.n2)):
+    def __init__(self, dir_data, dir_target, ids):
         self.dir_data = dir_data
         self.dir_target = dir_target
-        self.ids = data_ids
-        self.n1 = dim[0]
-        self.n2 = dim[1]
+        self.ids = ids
+        self.shape = (1, opts.n1, opts.n2)
 
     def __len__(self):
         return len(self.ids)
 
     def __getitem__(self, i):
-
-        idx = str(self.ids[i])
-
-        # Read data
-        data = {}
-
-        if opts.net == 'mtl':
-            data['img'] = read_array(self.dir_data + '/' + idx + '_img.bin', (1, self.n1, self.n2))
-            data['meq'] = torch.empty(0)
-
-        if opts.net == 'mtl-seismicity':
-            img = read_array(self.dir_data + '/' + idx + '_img.bin', (1, self.n1, self.n2))
-            meq = read_array(self.dir_data + '/' + idx + '_meq.bin', (1, self.n1, self.n2))
-            data['img'] = torch.cat((img, meq), dim=0)
-            data['meq'] = torch.empty(0)
-
-        if opts.net == 'scf':
-            data['img'] = read_array(self.dir_data + '/' + idx + '_img.bin', (1, self.n1, self.n2))
-            data['meq'] = read_array(self.dir_data + '/' + idx + '_meq.bin', (1, self.n1, self.n2))
-
-        if opts.net == 'scf-elastic':
-            if opts.pp:
-                pp = read_array(self.dir_data + '/' + idx + '_img_pp.bin', (1, self.n1, self.n2))
-            else:
-                pp = None
-            if opts.ps:
-                ps = read_array(self.dir_data + '/' + idx + '_img_ps.bin', (1, self.n1, self.n2))
-            else:
-                ps = None
-            if opts.sp:
-                sp = read_array(self.dir_data + '/' + idx + '_img_sp.bin', (1, self.n1, self.n2))
-            else:
-                sp = None
-            if opts.ss:
-                ss = read_array(self.dir_data + '/' + idx + '_img_ss.bin', (1, self.n1, self.n2))
-            else:
-                ss = None
-            data['img'] = torch.cat([t for t in [pp, ps, sp, ss] if t is not None], dim=0)
-            data['meq'] = read_array(self.dir_data + '/' + idx + '_meq.bin', (1, self.n1, self.n2))
-
-        # Read label
-        target = {}
-        target['fsem'] = read_array(self.dir_target + '/' + idx + '_fsem.bin', (1, self.n1, self.n2))
-        target['fdip'] = read_array(self.dir_target + '/' + idx + '_fdip.bin', (1, self.n1, self.n2))
-
+        d = self.dir_data + '/' + str(self.ids[i])
+        t = self.dir_target + '/' + str(self.ids[i])
+        img = read_array(d + '_img.bin', self.shape)
+        data = {'img': img / estimate_scale(img.unsqueeze(0))[0], 'meq': read_array(d + '_meq.bin', self.shape)}
+        target = {k: read_array(t + '_' + k + '.bin', self.shape) for k in ['fsem', 'fdip']}
+        # Faults indicated by the seismicity, the label of the seismicity-only mode; for data sets without it,
+        # the faults within 4 pixels of a seismicity location probability above 0.1
+        if os.path.isfile(t + '_fsem_meq.bin'):
+            target['fsem_meq'] = read_array(t + '_fsem_meq.bin', self.shape)
+        else:
+            near = torch.nn.functional.max_pool2d(data['meq'].unsqueeze(0), 9, 1, 4)[0] > 0.1
+            target['fsem_meq'] = target['fsem'] * near.float()
         return data, target
 
 
 def custom_loss(y_pred, y_true):
+    """Dice and binary cross entropy of the fault probability, and L1 of the dip on the true faults."""
 
-    # fault probability
-    mp = y_pred['fsem']
     mt = y_true['fsem']
-    loss_fsem = 1.0 - (2.0 * torch.sum(mp * mt) + 1.0) / (torch.sum(mp + mt) + 1.0)
+    loss_fsem = dice_loss(y_pred['fsem'], mt) + bce_loss(y_pred['fsem'], mt)
+    loss_fdip = masked_l1(y_pred['fdip_raw'], y_true['fdip'], mt) * opts.w_dip
 
-    # fault dip
-    dp = y_pred['fdip']
-    dt = y_true['fdip']
-    loss_fdip = F.l1_loss(dp, dt) * 10
-
-    loss = loss_fsem + loss_fdip
-
-    return loss, loss_fsem, loss_fdip
+    return loss_fsem + loss_fdip, loss_fsem, loss_fdip
 
 
-def custom_accuracy(y_pred, y_true):
-
-    # accuracy
-    accuracy = mf.classification.binary_accuracy(y_pred, y_true)
-
-    # ssim
-    s = ssim(y_pred, y_true, data_range=1.0)
-
-    # precision and recall
-    precision = mf.classification.binary_precision(y_pred, y_true)
-    recall = mf.classification.binary_recall(y_pred, y_true)
-
-    return accuracy, precision, recall, s
-
-
-#==============================================================================
+# ==============================================================================
 class mtlnet(pl.LightningModule):
 
-    def __init__(self, lr: float = 1.0e-4, warmup_epochs: int=10, max_epochs: int=100):
+    def __init__(self, lr=2.0e-4, warmup_epochs=5, max_epochs=60):
 
         super(mtlnet, self).__init__()
-        
-        self.warmup_epochs = warmup_epochs
-        self.max_epochs = max_epochs
 
         self.lr = lr
+        self.warmup_epochs = warmup_epochs
+        self.max_epochs = max_epochs
         self.l1 = 32
         self.l2 = 64
         self.l3 = 128
 
-        if opts.net == 'mtl' or opts.net == 'mtl-seismicity':
+        # Image and seismicity encoders, fused at the bottleneck and in the decoder
+        self.encoder1_img = resu1(1, self.l1)
+        self.encoder2_img = resu2(self.l1, self.l2)
+        self.encoder1_meq = resu1(1, self.l1)
+        self.encoder2_meq = resu2(self.l1, self.l2)
+        self.fusion3 = LocalSpatialChannelAttention((self.l2, self.l2), 2 * self.l2, channel_ratio=8)
+        self.encoder3 = resu3(2 * self.l2, self.l3)
+        self.decoder = mtl_decoder_fusion(self.l1, self.l2, self.l3, out_ch=self.l1, last_kernel_size=3)
 
-            if opts.net == 'mtl':
-                self.in_channels = 1
-            else:
-                self.in_channels = 2
-
-            self.encoder1 = resu1(self.in_channels, self.l1)
-            self.encoder2 = resu2(self.l1, self.l2)
-            self.encoder3 = resu3(self.l2, self.l3)
-            self.decoder = mtl_decoder_nofusion(self.l1, self.l2, self.l3, out_ch=self.l1, last_kernel_size=3)
-
-        if opts.net == 'scf' or opts.net == 'scf-elastic':
-
-            if opts.net == 'scf':
-                self.in_channels = 1
-            else:
-                self.in_channels = nc
-
-            self.encoder1_img = resu1(self.in_channels, self.l1)
-            self.encoder2_img = resu2(self.l1, self.l2)
-            self.encoder1_meq = resu1(1, self.l1)
-            self.encoder2_meq = resu2(self.l1, self.l2)
-
-            self.fusion3 = SpatialChannelAttention((self.l2, self.l2), 2*self.l2, channel_ratio=8)
-            self.encoder3 = resu3(2 * self.l2, self.l3)
-
-            self.decoder = mtl_decoder_fusion(self.l1, self.l2, self.l3, out_ch=self.l1, last_kernel_size=3)
-
-        self.subdecoder_fault_semantic = mtl_subdecoder(in_ch=self.l1,
-                                                        out_ch=1,
-                                                        bn=None,
-                                                        mid_activation='relu',
-                                                        activation='sigmoid')
-        self.subdecoder_fault_dip = mtl_subdecoder(in_ch=self.l1,
-                                                   out_ch=1,
-                                                   bn='instance',
-                                                   mid_activation='relu',
-                                                   activation='sigmoid')
+        # Heads of the fault probability and dip / 180
+        self.subdecoder_fault_semantic = mtl_subdecoder(in_ch=self.l1, out_ch=1, bn=False, mid_activation='relu', activation='sigmoid')
+        self.subdecoder_fault_dip = mtl_subdecoder(in_ch=self.l1, out_ch=1, bn=True, mid_activation='relu', activation='sigmoid')
 
     def forward(self, x):
 
-        if opts.net == 'mtl' or opts.net == 'mtl-seismicity':
+        e1_img = self.encoder1_img(x['img'])
+        e2_img = self.encoder2_img(maxpool(e1_img, 2))
+        e1_meq = self.encoder1_meq(x['meq'])
+        e2_meq = self.encoder2_meq(maxpool(e1_meq, 2))
+        e3 = self.encoder3(self.fusion3(maxpool(e2_img, 2), maxpool(e2_meq, 2)))
+        f = self.decoder(x['img'], e1_img, e2_img, e1_meq, e2_meq, e3)
 
-            # Migration image encoder
-            out_encoder1 = self.encoder1(x['img'])
-            out_encoder2 = self.encoder2(maxpool(out_encoder1, 2))
-            out_encoder3 = self.encoder3(maxpool(out_encoder2, 2))
-
-            # Decoders
-            out_fault = self.decoder(x['img'], out_encoder1, out_encoder2, out_encoder3)
-
-        if opts.net == 'scf' or opts.net == 'scf-elastic':
-
-            # Migration image encoder
-            out_encoder1_img = self.encoder1_img(x['img'])
-            out_encoder2_img = self.encoder2_img(maxpool(out_encoder1_img, 2))
-
-            # Seismicity image encoder
-            out_encoder1_meq = self.encoder1_meq(x['meq'])
-            out_encoder2_meq = self.encoder2_meq(maxpool(out_encoder1_meq, 2))
-
-            # Bottleneck encoder
-            f3 = self.fusion3(maxpool(out_encoder2_img, 2), maxpool(out_encoder2_meq, 2))
-            out_encoder3 = self.encoder3(f3)
-
-            # Decoders
-            out_fault = self.decoder(x['img'], out_encoder1_img, out_encoder2_img, out_encoder1_meq, out_encoder2_meq, out_encoder3)
-
-        # Subdecoders
-        out_fault_semantic = self.subdecoder_fault_semantic(out_fault)
-        out_fault_dip = self.subdecoder_fault_dip(out_fault) * out_fault_semantic
-        out = {}
-        out['fsem'] = out_fault_semantic
-        out['fdip'] = out_fault_dip
+        # The dip is learned on the faults only (fdip_raw), and the output dip is masked by the fault probability
+        out = {'fsem': self.subdecoder_fault_semantic(f), 'fdip_raw': self.subdecoder_fault_dip(f)}
+        out['fdip'] = out['fdip_raw'] * out['fsem']
 
         return out
 
-    def training_step(self, batch):
+    def freeze_bn(self):
+        # Fixed batch-normalization statistics in the final epochs, so that the training ends with the
+        # normalization of inference
+        if opts.bn_freeze > 0 and self.current_epoch >= self.max_epochs - opts.bn_freeze:
+            for m in self.modules():
+                if isinstance(m, nn.modules.batchnorm._BatchNorm):
+                    m.eval()
+
+    def on_train_epoch_start(self):
+
+        self.freeze_bn()
+
+    def on_train_batch_start(self, batch, batch_idx):
+
+        self.freeze_bn()
+
+    def training_step(self, batch, batch_idx):
 
         x, y_true = batch
         y_pred = self.forward(x)
 
-        loss, loss_fault_semantic, loss_fault_dip = custom_loss(y_pred, y_true)
-        self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("train_loss_fsem", loss_fault_semantic, on_step=False, on_epoch=True, prog_bar=False)
-        self.log("train_loss_fdip", loss_fault_dip, on_step=False, on_epoch=True, prog_bar=False)
+        loss, loss_fsem, loss_fdip = custom_loss(y_pred, y_true)
+        self.log('train_loss_fsem', loss_fsem, on_step=False, on_epoch=True, sync_dist=True)
+        self.log('train_loss_fdip', loss_fdip, on_step=False, on_epoch=True, sync_dist=True)
+        self.log('train_f1', fault_scores(y_pred['fsem'].detach(), y_true['fsem'], tol=opts.tol)[2], on_step=False, on_epoch=True,
+                 sync_dist=True)
 
-        accuracy, precision, recall, s = custom_accuracy(y_pred['fsem'], y_true['fsem'])
-        self.log("train_accuracy", accuracy, on_step=False, on_epoch=True, prog_bar=False)
-        self.log("train_precision", precision, on_step=False, on_epoch=True, prog_bar=False)
-        self.log("train_recall", recall, on_step=False, on_epoch=True, prog_bar=False)
-        self.log("train_ssim", s, on_step=False, on_epoch=True, prog_bar=False)
+        # Patch consistency: the faults of a random sub-crop should be those of the whole crop, including near the
+        # sub-crop edges, so that block-wise inference reproduces whole-image inference with small blocks
+        if opts.w_consist > 0:
+            sl = random_subcrop(x['img'].shape[2:])
+            y_sub = self.forward({k: v[sl] for k, v in x.items()})
+            loss_consist = kl_loss(y_sub['fsem'], y_pred['fsem'][sl].detach())
+            self.log('train_loss_consist', loss_consist, on_step=False, on_epoch=True, sync_dist=True)
+            loss = loss + opts.w_consist * loss_consist
+
+        self.log('train_loss', loss, on_step=False, on_epoch=True, sync_dist=True, prog_bar=True)
 
         return loss
 
-    def validation_step(self, batch):
+    def validation_step(self, batch, batch_idx):
 
-        x, y_true = batch
-        y_pred = self.forward(x)
-
-        loss, loss_fault_semantic, loss_fault_dip = custom_loss(y_pred, y_true)
-        self.log("valid_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("valid_loss_fsem", loss_fault_semantic, on_step=False, on_epoch=True, prog_bar=False)
-        self.log("valid_loss_fdip", loss_fault_dip, on_step=False, on_epoch=True, prog_bar=False)
-
-        accuracy, precision, recall, s = custom_accuracy(y_pred['fsem'], y_true['fsem'])
-        self.log("valid_accuracy", accuracy, on_step=False, on_epoch=True, prog_bar=False)
-        self.log("valid_precision", precision, on_step=False, on_epoch=True, prog_bar=False)
-        self.log("valid_recall", recall, on_step=False, on_epoch=True, prog_bar=False)
-        self.log("valid_ssim", s, on_step=False, on_epoch=True, prog_bar=False)
+        x, y = batch
+        loss = 0.0
+        for mode in MODES:
+            xm, y_true = apply_mode(x, y, mode)
+            y_pred = self.forward(xm)
+            l = custom_loss(y_pred, y_true)[0]
+            self.log('valid_loss_' + mode, l, on_step=False, on_epoch=True, sync_dist=True)
+            self.log('valid_f1_' + mode, fault_scores(y_pred['fsem'], y_true['fsem'], tol=opts.tol)[2], on_step=False,
+                     on_epoch=True, sync_dist=True)
+            loss = loss + WEIGHTS[mode] * l
+        self.log('valid_loss', loss, on_step=False, on_epoch=True, sync_dist=True, prog_bar=True)
 
         return loss
 
     def configure_optimizers(self):
 
-        optimizer = Adam(self.parameters(), lr=1e-4)
+        optimizer = Adam(self.parameters(), lr=self.lr)
 
         def lr_lambda(epoch):
+            # linear warmup and cosine decay
             if epoch < self.warmup_epochs:
-                # Linear warmup
                 return float(epoch + 1) / float(self.warmup_epochs)
-            # Cosine decay
-            progress = (epoch - self.warmup_epochs) / (self.max_epochs - self.warmup_epochs)
-            return 0.5 * (1 + math.cos(math.pi * progress))
+            progress = (epoch - self.warmup_epochs) / max(1, self.max_epochs - self.warmup_epochs)
+            return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
 
-        scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
-
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "epoch",
-                "frequency": 1,
-            }
-        }
+        return {'optimizer': optimizer, 'lr_scheduler': {'scheduler': LambdaLR(optimizer, lr_lambda=lr_lambda), 'interval': 'epoch'}}
 
 
+def load_model(path):
 
-#==============================================================================
+    net = mtlnet()
+    net.load_state_dict(torch.load(path, map_location='cpu', weights_only=False)['state_dict'])
+
+    return net.to(device).eval()
+
+
+def normalize_image(img):
+    """Amplitude normalization of a whole image (1, 1, n1, n2), before any block-wise inference."""
+
+    if opts.scale == 'agc':
+        return agc(img, opts.agc_sigma)
+    return img / estimate_scale(img)
+
+
+def predict(net, data, block=(0, 0), overlap=(0, 0)):
+    """
+    Fault probability and dip of a whole image (data: dictionary of (1, 1, n1, n2) tensors), from the whole image or
+    block by block. The image can stay in the CPU memory: every block is moved to the device of the network, and
+    the outputs are blended on the device of the inputs.
+    """
+
+    def fn(d):
+        with torch.no_grad():
+            if opts.precision in ('16-mixed', 'bf16-mixed'):
+                dtype = torch.float16 if opts.precision == '16-mixed' else torch.bfloat16
+                with torch.autocast(device_type=device.type, dtype=dtype):
+                    out = net(d)
+            else:
+                out = net(d)
+        return {k: out[k].float() for k in ['fsem', 'fdip_raw']}
+
+    out = predict_blocks(fn, data, block, overlap, device=device)
+    out['fdip'] = out['fdip_raw'] * out['fsem']
+
+    return out
+
+
+# ==============================================================================
+class Scores:
+    """Fault precision, recall and F1 with a distance tolerance over a data set, and dip errors."""
+
+    def __init__(self):
+
+        self.c = np.zeros(4)
+        self.e = np.zeros(2)
+        self.loss = 0.0
+        self.n = 0
+
+    def add(self, p, t, out=None, label=None, loss=None):
+
+        pb = (p > 0.5).float()
+        tb = (t > 0.5).float()
+        self.c += [float(torch.sum(pb * dilate(tb, opts.tol))), float(torch.sum(pb)), float(torch.sum(tb * dilate(pb, opts.tol))),
+                   float(torch.sum(tb))]
+        if out is not None:
+            # dip errors (degrees) of the true faults found, modulo 180 degrees (dips near 0 and 180 degrees are
+            # almost the same line)
+            on = (pb * tb) > 0
+            dd = torch.abs(out['fdip_raw'] - label['fdip'])[on] * 180.0
+            self.e += [float(torch.sum(torch.minimum(dd, 180.0 - dd))), float(torch.sum(on))]
+        if loss is not None:
+            self.loss += float(loss)
+            self.n += 1
+
+    def result(self):
+
+        tp_p, n_p, tp_r, n_t = self.c
+        p = tp_p / n_p if n_p > 0 else (1.0 if n_t == 0 else 0.0)
+        r = tp_r / n_t if n_t > 0 else (1.0 if n_p == 0 else 0.0)
+        out = {'precision': p, 'recall': r, 'f1': 2 * p * r / (p + r) if p + r > 0 else 0.0}
+        if self.e[1] > 0:
+            out['dip_error'] = self.e[0] / self.e[1]
+        if self.n > 0:
+            out['loss'] = self.loss / self.n
+        return out
+
+
+def plot_sample(img, meq, fsem, fsem_meq, pred, filename):
+    """
+    Faults of one validation image for the three input modes: the true faults (for the seismicity only, the faults
+    that the seismicity indicates) and the predicted faults, on the image (with the seismicity in blue for both
+    inputs) or on the seismicity image. Faults (probability at least 0.5) are red. Modes are columns, or rows for
+    a wide image.
+    """
+
+    n1, n2 = img.shape
+    red = ListedColormap(['#ff0000'])
+    blue = ListedColormap(['#0000ff'])
+    cases = [('image', 'img', False, fsem), ('both', 'img', True, fsem), ('meq', 'meq', False, fsem_meq)]
+    wide = n2 >= 2 * n1
+    if wide:
+        fig, ax = plt.subplots(3, 2, figsize=(7.2, 3 * 3.6 * n1 / n2 + 0.6), squeeze=False)
+    else:
+        fig, ax = plt.subplots(2, 3, figsize=(7.2, 2 * 2.4 * n1 / n2 + 0.6), squeeze=False)
+    for m, (mode, back, with_meq, label) in enumerate(cases):
+        for k, (name, f) in enumerate([('True Faults', label), ('Predicted Faults', pred[mode])]):
+            a = ax[m][k] if wide else ax[k][m]
+            if back == 'meq':
+                a.imshow(meq, cmap='binary', vmin=0, vmax=1, interpolation='none', aspect='equal')
+            else:
+                a.imshow(img, cmap='gray', vmin=-2.5, vmax=2.5, interpolation='none', aspect='equal')
+                if with_meq:
+                    a.imshow(np.ma.masked_where(meq < 0.5, meq), cmap=blue, interpolation='none', aspect='equal')
+            a.imshow(np.ma.masked_where(f < 0.5, f), cmap=red, interpolation='none', aspect='equal')
+            a.set_xticks([])
+            a.set_yticks([])
+            a.set_title(TITLES[mode] + ', ' + name)
+    plt.tight_layout(pad=0.2, w_pad=0.3, h_pad=0.3)
+    plt.savefig(filename, dpi=200, bbox_inches='tight', pad_inches=0.02)
+    plt.close()
+
+
+def plot_scores(scores, filename):
+    """Precision, recall and F1, and the dip errors, of the three input modes."""
+
+    colors = {'image': '#0000ff', 'both': '#ff0000', 'meq': '#000000'}
+    w = 0.26
+    fig, ax = plt.subplots(1, 2, figsize=(7.2, 2.6), gridspec_kw={'width_ratios': [3, 1.4]})
+    for j, mode in enumerate(MODES):
+        s = scores[mode]
+        ax[0].bar(np.arange(3) + (j - 1) * w, [s['precision'], s['recall'], s['f1']], w, color=colors[mode], label=TITLES[mode])
+        ax[1].bar([(j - 1) * w], [s.get('dip_error', 0.0)], w, color=colors[mode])
+    ax[0].set_xticks(np.arange(3), ['Precision', 'Recall', 'F1'])
+    ax[0].set_ylim(0, 1)
+    ax[0].set_ylabel('Score')
+    ax[0].legend(loc='lower center', bbox_to_anchor=(0.5, 1.0), ncol=3, fontsize=8, frameon=False)
+    ax[1].set_xticks([0], ['Dip'])
+    ax[1].set_ylabel('Mean Error (Degrees)')
+    plt.tight_layout(pad=0.3)
+    plt.savefig(filename, dpi=200, bbox_inches='tight', pad_inches=0.02)
+    plt.close()
+
+
+# ==============================================================================
 if __name__ == '__main__':
 
-    if opts.input is None and opts.check is None:
-        ## Training phase
-
-        logger = TensorBoardLogger(opts.dir_output)
-        checkpoint_callback = ModelCheckpoint(monitor='valid_loss',
-                                              dirpath=opts.dir_output,
-                                              filename='{epoch:d}',
-                                              mode='min',
-                                              save_top_k=opts.epochs,
-                                              save_last=True)
-
-        lr_monitor = LearningRateMonitor(logging_interval='step')
-
-        params = {
-            'max_epochs': opts.epochs,
-            'default_root_dir': opts.dir_output,
-            'logger': logger,
-            'callbacks': [checkpoint_callback, lr_monitor],
-            'precision': opts.precision
-        }
-
-        if torch.cuda.is_available() and opts.gpus_per_node >= 1:
-            params['devices'] = opts.gpus_per_node
-            params['num_nodes'] = opts.nodes
-            params['accelerator'] = 'gpu'
-            params['strategy'] = 'ddp'
-
-        trainer = pl.Trainer(**params)
-
-        t = BasicDataset(opts.dir_data_train,
-                         opts.dir_target_train,
-                         data_ids=np.arange(0, opts.ntrain),
-                         dim=(opts.n1, opts.n2))
-        train_loader = DataLoader(t, batch_size=opts.batch_train, num_workers=opts.threads, shuffle=True)
-
-        v = BasicDataset(opts.dir_data_valid,
-                         opts.dir_target_valid,
-                         data_ids=np.arange(0, opts.nvalid),
-                         dim=(opts.n1, opts.n2))
-        valid_loader = DataLoader(v, batch_size=opts.batch_valid, num_workers=opts.threads)
+    if opts.model is None and opts.check is None:
+        ## Training
 
         set_random_seed(opts.seed)
-        params = {'lr': opts.lr, 
-                  'warmup_epochs': opts.warmup,
-                  'max_epochs': opts.epochs}
-        net = mtlnet(**params)
-        
-        # If fine tuning, then read the pre-trained model
-        if opts.finetune is not None:
-            net.load_state_dict(torch.load(opts.finetune, map_location=device)['state_dict'])
-            net.to(device)
+        # data-loader workers are seeded by their rank too, so that every GPU draws its own crops, modes and gains
+        pl.seed_everything(opts.seed, workers=True)
 
-        # If resuming from a breakpoint, read the breakpoint model
-        if opts.resume:
-            trainer.fit(net, train_loader, valid_loader, ckpt_path=opts.resume)
-        else:
-            trainer.fit(net, train_loader, valid_loader)
+        # a new training in the same directory overwrites last.ckpt (instead of writing last-v1.ckpt)
+        checkpoint = ModelCheckpoint(monitor='valid_loss', dirpath=opts.dir_output, filename='{epoch:d}', mode='min',
+                                     save_top_k=3, save_last=True, enable_version_counter=False)
+        params = {'max_epochs': opts.epochs, 'default_root_dir': opts.dir_output, 'logger': TensorBoardLogger(opts.dir_output),
+                  'callbacks': [checkpoint, LearningRateMonitor(logging_interval='epoch')], 'precision': opts.precision,
+                  'accelerator': 'gpu' if use_gpu else 'cpu', 'devices': max(1, opts.gpus_per_node), 'num_nodes': opts.nodes}
+        if params['devices'] * opts.nodes > 1:
+            # one process per GPU; batch normalization uses the batches of all GPUs
+            params['strategy'] = 'ddp'
+            params['sync_batchnorm'] = use_gpu
+        trainer = pl.Trainer(**params)
+
+        collate = CropCollate((opts.crop1, opts.crop2), None, opts.p_image, opts.p_meq, opts.gain, opts.flip, opts.meq_blur)
+        train_loader = DataLoader(BasicDataset(opts.dir_data_train, opts.dir_target_train, np.arange(opts.ntrain)),
+                                  batch_size=opts.batch_train, num_workers=opts.threads, shuffle=True, collate_fn=collate,
+                                  drop_last=True, pin_memory=use_gpu, persistent_workers=opts.threads > 0)
+        valid_loader = DataLoader(BasicDataset(opts.dir_data_valid, opts.dir_target_valid, np.arange(opts.nvalid)),
+                                  batch_size=opts.batch_valid, num_workers=opts.threads, pin_memory=use_gpu,
+                                  persistent_workers=opts.threads > 0)
+
+        net = mtlnet(lr=opts.lr, warmup_epochs=opts.warmup, max_epochs=opts.epochs)
+        if opts.finetune is not None:
+            net.load_state_dict(torch.load(opts.finetune, map_location='cpu', weights_only=False)['state_dict'])
+
+        trainer.fit(net, train_loader, valid_loader, ckpt_path=opts.resume)
 
         print(date_time(), ' >> Training finished')
 
-    if opts.input is None and opts.check is not None:
-        ## Validation phase
-        
+    if opts.model is None and opts.check is not None:
+        ## Validation: metrics of the three input modes, and figures and fault probabilities of the first samples
+
         set_font()
+        plt.rcParams.update({'font.size': 9, 'axes.titlesize': 9, 'axes.labelsize': 9})
+        os.makedirs(opts.dir_output, exist_ok=True)
+        net = load_model(opts.check)
+        valid_loader = DataLoader(BasicDataset(opts.dir_data_valid, opts.dir_target_valid, np.arange(opts.nvalid)), batch_size=1,
+                                  num_workers=min(opts.threads, 4))
 
-        v = BasicDataset(opts.dir_data_valid,
-                         opts.dir_target_valid,
-                         data_ids=np.arange(0, opts.nvalid),
-                         dim=(opts.n1, opts.n2))
-        valid_loader = DataLoader(v, batch_size=opts.batch_valid, num_workers=opts.threads)
+        scores = {m: Scores() for m in MODES + ['agreement']}
+        for i, (data, label) in enumerate(tqdm(valid_loader, desc='validation', unit='image')):
+            pred = {}
+            for mode in MODES:
+                x, y = apply_mode(data, label, mode)
+                x = {k: v.to(device) for k, v in x.items()}
+                y = {k: v.to(device) for k, v in y.items()}
+                out = predict(net, x)
+                scores[mode].add(out['fsem'], y['fsem'], out, y, custom_loss(out, y)[0])
+                pred[mode] = out['fsem']
+            # agreement of the faults from both inputs with those from the image only
+            scores['agreement'].add(pred['both'], (pred['image'] > 0.5).float())
+            if i < opts.nplot:
+                for mode in MODES:
+                    write_array(get_numpy(pred[mode]), '%s/predict_%d.%s.fsem' % (opts.dir_output, i, mode))
+                plot_sample(get_numpy(data['img']), get_numpy(data['meq']), get_numpy(label['fsem']), get_numpy(label['fsem_meq']),
+                            {m: get_numpy(v) for m, v in pred.items()}, '%s/predict_%d.png' % (opts.dir_output, i))
 
-        net = mtlnet()
-        net.load_state_dict(torch.load(opts.check, map_location=device)['state_dict'])
-        net.to(device)
-        
-        # Plot the validation results
-        l = 1
-        loss_average = 0
-        loss_fault_semantic_average = 0
-        loss_fault_dip_average = 0
-        accuracy_average = 0
-        precision_average = 0
-        recall_average = 0
-        ssim_average = 0
-        with tqdm(total=len(v), desc='', unit='image') as pbar:
-
-            for (input, target) in valid_loader:
-                
-                target['fsem'] = target['fsem'].to(device)
-                target['fdip'] = target['fdip'].to(device)
-
-                with torch.no_grad():
-                    input['img'] = input['img'].to(device)
-                    input['meq'] = input['meq'].to(device)
-                    predict = net(input)
-
-                # Metrics     
-                d1, d2, d3 = custom_loss(predict, target)
-                a1, a2, a3, a4 = custom_accuracy(predict['fsem'], target['fsem'])
-                loss_average = loss_average + d1
-                loss_fault_semantic_average = loss_fault_semantic_average + d2
-                loss_fault_dip_average = loss_fault_dip_average + d3
-                accuracy_average = accuracy_average + a1
-                precision_average = precision_average + a2
-                recall_average = recall_average + a3
-                ssim_average = ssim_average + a4
-                    
-                # For each batch
-                bs = opts.batch_valid
-                for i in range(0, bs):
-                    
-                    # Save prediction
-                    ir = (l - 1) * opts.batch_valid + i
-                    fsem = get_numpy(predict['fsem'][i])
-                    fdip = get_numpy(predict['fdip'][i])
-                    write_array(fsem, opts.dir_output + '/predict_' + str(ir) + '_fsem.bin')
-                    write_array(fdip, opts.dir_output + '/predict_' + str(ir) + '_fdip.bin')
-                    
-                    if opts.plot:
-                    
-                        # Plot
-                        if opts.net == 'mtl':
-                            im = get_numpy(input['img'][i])
-                            mq = np.zeros_like(im)
-                            
-                        if opts.net == 'mtl-seismicity':
-                            im = get_numpy(input['img'][i][0])
-                            mq = get_numpy(input['img'][i][1])
-                            
-                        if opts.net == 'scf':
-                            im = get_numpy(input['img'][i])
-                            mq = get_numpy(input['meq'][i])
-                            
-                        if opts.net == 'scf-elastic':
-                            im = get_numpy(input['img'][i][0])
-                            # im = np.transpose(im, (1, 0, 2)).reshape(opts.n1, opts.n2 * nc)
-                            mq = get_numpy(input['meq'][i])
-    
-                        # Plot input and output
-                        fig, ax = plt.subplots(2, 3, figsize=(9.5, 6))
-    
-                        plot_img = ax[0][0].imshow(im, cmap='gray', vmin=-3, vmax=3)
-                        ax[0][0].set_title('Input - Image')
-                        if opts.net != 'mtl':
-                            plot_meq = ax[1][0].imshow(mq, cmap='jet', vmin=0, vmax=1)
-                            ax[1][0].set_title('Input - Seismicity')
-                        else:
-                            ax[1][0].axis('off')
-                        
-                        fsem = get_numpy(target['fsem'][i])
-                        fdip = get_numpy(target['fdip'][i])
-                        plot_fsem = ax[0][1].imshow(fsem, cmap='viridis', vmin=0, vmax=1)
-                        ax[0][1].set_title('Probability - GT')
-                        plot_fdip = ax[0][2].imshow(fdip, cmap='jet', vmin=0, vmax=1)
-                        ax[0][2].set_title('Dip - GT')
-                        
-                        fsem = get_numpy(predict['fsem'][i])
-                        fdip = get_numpy(predict['fdip'][i])
-                        ax[1][1].imshow(fsem, cmap='viridis', vmin=0, vmax=1)
-                        ax[1][1].set_title('Probability - Prediction')
-                        ax[1][2].imshow(fdip, cmap='jet', vmin=0, vmax=1)
-                        ax[1][2].set_title('Dip - Prediction')
-                        
-                        for ii in range(2):
-                            for jj in range(3):
-                        
-                                # Move x-axis labels to top
-                                ax[ii][jj].xaxis.tick_top()
-                                ax[ii][jj].xaxis.set_label_position('top')
-                            
-                                # Set major and minor ticks
-                                ax[ii][jj].xaxis.set_major_locator(MultipleLocator(100))
-                                ax[ii][jj].xaxis.set_minor_locator(MultipleLocator(10))
-                                ax[ii][jj].yaxis.set_major_locator(MultipleLocator(100))
-                                ax[ii][jj].yaxis.set_minor_locator(MultipleLocator(10))
-    
-                        # Add 3 vertical colorbars evenly spaced vertically on the right
-                        if opts.net != 'mtl':
-                            
-                            # Adjust left, bottom, width, height of each
-                            cb_width = 0.015
-                            cb_left = 0.92
-                            cb_height = 0.19
-                            spacing = 0.025
-                            
-                            bottoms = [0.725, 0.5, 0.275, 0.05]
-                            
-                            cb_axes = [fig.add_axes([cb_left, b, cb_width, cb_height]) for b in bottoms]
-                            
-                            # Add colorbars with custom titles
-                            cb1 = fig.colorbar(plot_img, cax=cb_axes[0])
-                            cb2 = fig.colorbar(plot_meq, cax=cb_axes[1])
-                            cb3 = fig.colorbar(plot_fsem, cax=cb_axes[2])
-                            cb4 = fig.colorbar(plot_fdip, cax=cb_axes[3])
-                            
-                            cb1.set_label("Image Amplitude", rotation=90, labelpad=10)
-                            cb2.set_label("Seismicity", rotation=90, labelpad=10)
-                            cb3.set_label("Probability", rotation=90, labelpad=10)
-                            cb4.set_label("Dip", rotation=90, labelpad=10)
-                            
-                            cb1.locator = MultipleLocator(1)
-                            cb1.update_ticks()
-                            cb2.locator = MultipleLocator(0.5)
-                            cb2.update_ticks()
-                            cb3.locator = MultipleLocator(0.5)
-                            cb3.update_ticks()
-                            cb4.locator = MultipleLocator(0.5)
-                            cb4.update_ticks()
-                            
-                            for label in cb1.ax.get_yticklabels():
-                                label.set_rotation(90)
-                            for label in cb2.ax.get_yticklabels():
-                                label.set_rotation(90)
-                            for label in cb3.ax.get_yticklabels():
-                                label.set_rotation(90)
-                            for label in cb4.ax.get_yticklabels():
-                                label.set_rotation(90)
-                            
-                        else:
-                            
-                            # Adjust left, bottom, width, height of each
-                            cb_width = 0.015
-                            cb_left = 0.92
-                            cb_height = 0.25  # ~1/3 of the figure
-                            spacing = 0.05    # vertical spacing between them
-                            
-                            bottoms = [0.65, 0.35, 0.05]  # Positions for 3 colorbars
-                            
-                            cb_axes = [fig.add_axes([cb_left, b, cb_width, cb_height]) for b in bottoms]
-                            
-                            # Add colorbars with custom titles
-                            cb1 = fig.colorbar(plot_img, cax=cb_axes[0])
-                            cb2 = fig.colorbar(plot_fsem, cax=cb_axes[1])
-                            cb3 = fig.colorbar(plot_fdip, cax=cb_axes[2])
-                            
-                            cb1.set_label("Image Amplitude", rotation=90, labelpad=10)
-                            cb2.set_label("Probability", rotation=90, labelpad=10)
-                            cb3.set_label("Dip", rotation=90, labelpad=10)
-                            
-                            cb1.locator = MultipleLocator(1)
-                            cb1.update_ticks()
-                            cb2.locator = MultipleLocator(0.5)
-                            cb2.update_ticks()
-                            cb3.locator = MultipleLocator(0.5)
-                            cb3.update_ticks()
-                            
-                            for label in cb1.ax.get_yticklabels():
-                                label.set_rotation(90)
-                            for label in cb2.ax.get_yticklabels():
-                                label.set_rotation(90)
-                            for label in cb3.ax.get_yticklabels():
-                                label.set_rotation(90)
-                                        
-                        plt.tight_layout(rect=[0, 0, 0.9, 1])
-
-                        plt.savefig(opts.dir_output + '/predict_' + str(ir) + '.pdf', dpi=300, bbox_inches='tight', pad_inches=1.0/72.0)
-                        # plt.show()
-                        plt.close()
-
-                pbar.update(bs)
-                l = l + 1
-
-        # Output validation set metrics
-        l = l - 1
-        loss_average = loss_average / l
-        loss_fault_semantic_average = loss_fault_semantic_average / l
-        loss_fault_dip_average = loss_fault_dip_average / l
-        accuracy_average = accuracy_average / l
-        precision_average = precision_average / l
-        recall_average = recall_average / l
-        ssim_average = ssim_average / l
-
+        result = {m: s.result() for m, s in scores.items()}
+        with open(opts.dir_output + '/metrics_validation.json', 'w') as f:
+            json.dump(result, f, indent=1)
         with open(opts.dir_output + '/metrics_validation.txt', 'w') as f:
-            f.write('loss' + '\t' + str(get_numpy(loss_average)) + '\n')
-            f.write('loss_fault_semantic' + '\t' + str(get_numpy(loss_fault_semantic_average)) + '\n')
-            f.write('loss_fault_dip' + '\t' + str(get_numpy(loss_fault_dip_average)) + '\n')
-            f.write('accuracy' + '\t' + str(get_numpy(accuracy_average)) + '\n')
-            f.write('precision' + '\t' + str(get_numpy(precision_average)) + '\n')
-            f.write('recall' + '\t' + str(get_numpy(recall_average)) + '\n')
-            f.write('ssim' + '\t' + str(get_numpy(ssim_average)) + '\n')
-            f.close()
-
+            f.write('%-20s %9s %9s %9s %11s %9s\n' % ('mode', 'precision', 'recall', 'f1', 'dip_error', 'loss'))
+            for mode in MODES:
+                s = result[mode]
+                f.write('%-20s %9.4f %9.4f %9.4f %11.2f %9.4f\n' % (TITLES[mode], s['precision'], s['recall'], s['f1'],
+                                                                     s.get('dip_error', np.nan), s['loss']))
+            f.write('F1 of the faults from both inputs against those from the image only: %.4f\n' % result['agreement']['f1'])
+        plot_scores(result, opts.dir_output + '/metrics_validation.png')
+        print(open(opts.dir_output + '/metrics_validation.txt').read())
         print(date_time(), ' >> Validation finished')
 
-    if opts.input is not None:
-        ## Inference phase
+    if opts.model is not None:
+        ## Inference
 
-        # Read image
-        n1 = opts.n1
-        n2 = opts.n2
+        net = load_model(opts.model)
+        n1, n2 = opts.n1, opts.n2
+        shape = (1, 1, n1, n2)
+        assert opts.output is not None, 'inference needs --output'
+        assert opts.input is not None or opts.input_meq is not None or opts.input_events is not None, \
+            'inference needs an image (--input), a seismicity image (--input_meq) or events (--input_events)'
 
-        # # Load trained model
-        net = mtlnet()
-        net.load_state_dict(torch.load(opts.model, map_location=device)['state_dict'])
-        net.to(device)
-
-        print(date_time(), ' >> Pretrained model loaded')
-
-        b1 = opts.b1
-        b2 = opts.b2
-    
-        if b1 is None and b2 is None:
-            # Infer using the entire seismic image and source image
-            
-            data = {}
-            
-            if opts.net == 'mtl':
-                data['img'] = read_array(opts.input + '.img', (1, 1, n1, n2))
-                data['meq'] = torch.empty(0)
-            
-            if opts.net == 'mtl-seismicity':
-                x1 = read_array(opts.input + '.img', (1, 1, n1, n2))
-                x2 = read_array(opts.input + '.meq', (1, 1, n1, n2))
-                data['img'] = torch.cat((x1, x2), dim=0)
-                data['meq'] = torch.empty(0)
-            
-            if opts.net == 'scf':
-                data['img'] = read_array(opts.input + '.img', (1, 1, n1, n2))
-                data['meq'] = read_array(opts.input + '.meq', (1, 1, n1, n2))
-            
-            if opts.net == 'scf-elastic':
-                if opts.pp:
-                    pp = read_array(opts.input + '.img.pp', (1, 1, n1, n2))
-                if opts.ps:
-                    ps = read_array(opts.input + '.img.ps', (1, 1, n1, n2))
-                if opts.sp:
-                    sp = read_array(opts.input + '.img.sp', (1, 1, n1, n2))
-                if opts.ss:
-                    ss = read_array(opts.input + '.img.ss', (1, 1, n1, n2))
-                data['img'] = torch.cat([t for t in [pp, ps, sp, ss] if t is not None], dim=1)
-                data['meq'] = read_array(opts.input + '.meq', (1, 1, n1, n2))
-                
-            data['img'] = data['img'].to(device)
-            data['meq'] = data['meq'].to(device)
-            with torch.no_grad():
-                with torch.autocast(device_type=device.type, dtype=torch.float16):
-                    predict = net(data)
-    
+        # The image stays in the CPU memory, and only the blocks go to the GPU
+        img = read_array(opts.input, shape) if opts.input is not None else torch.zeros(shape)
+        if opts.input_events is not None:
+            ev = np.loadtxt(opts.input_events, ndmin=2)
+            meq = torch.from_numpy(render_seismicity(ev[:, 0], ev[:, 1], (n1, n2)))[None, None]
+        elif opts.input_meq is not None:
+            meq = read_array(opts.input_meq, shape).clamp(0, 1)
         else:
-            # For large models, infer block by block
-                
-            img = None
-            meq = None
-            pp = None
-            ps = None
-            sp = None
-            ss = None
-                        
-            if opts.net == 'mtl':
-                img = read_array(opts.input + '.img', (1, 1, n1, n2))
+            meq = torch.zeros(shape)
+        img = normalize_image(img)
 
-            if opts.net == 'mtl-seismicity':
-                img = read_array(opts.input + '.img', (1, 1, n1, n2))
-                meq = read_array(opts.input + '.meq', (1, 1, n1, n2))
-            
-            if opts.net == 'scf':
-                img = read_array(opts.input + '.img', (1, 1, n1, n2))
-                meq = read_array(opts.input + '.meq', (1, 1, n1, n2))
-
-            if opts.net == 'scf-elastic':
-                if opts.pp:
-                    pp = read_array(opts.input + '.img.pp', (1, 1, n1, n2))
-                if opts.ps:
-                    ps = read_array(opts.input + '.img.ps', (1, 1, n1, n2))
-                if opts.sp:
-                    sp = read_array(opts.input + '.img.sp', (1, 1, n1, n2))
-                if opts.ss:
-                    ss = read_array(opts.input + '.img.ss', (1, 1, n1, n2))
-                meq = read_array(opts.input + '.meq', (1, 1, n1, n2))
-                
-            for i in [img, meq, pp, ps, sp, ss]:
-                if i is not None:
-                    i = F.pad(i, [0, n2 - opts.n2, 0, n1 - opts.n1], mode='reflect')
-
-            predict = {}
-            predict['fsem'] = torch.zeros((1, 1, n1, n2))
-            predict['fdip'] = torch.zeros((1, 1, n1, n2))
-            predict['fstrike'] = torch.zeros((1, 1, n1, n2))
-            
-            if b1 is None:
-                b1 = n1
-            if b2 is None:
-                b2 = n2
-    
-            p1 = opts.p1
-            p2 = opts.p2
-            
-            nb1, s1, e1 = rollover_block(n1, b1, p1, allow_longer=True)
-            nb2, s2, e2 = rollover_block(n2, b2, p2, allow_longer=True)
-            
-            n1 = e1[-1] + 1
-            n2 = e2[-1] + 1
-            if b1 is None:
-                b1 = n1
-            if b2 is None:
-                b2 = n2
-            
-            for i in range(nb1):
-                for j in range(nb2):
-                        
-                    # Note Python's a:b is actually a..b - 1 in other languages
-                    i1 = s1[i]
-                    h1 = e1[i] + 1
-                    i2 = s2[j]
-                    h2 = e2[j] + 1
-                    
-                    print(date_time(), ' >> Block index = ', 
-                          str(i + 1) + '/' + str(nb1) + ', ', 
-                          str(j + 1) + '/' + str(nb2))
-                    print(date_time(), ' >> Block range = ', 
-                          str(i1 + 1) + '-' + str(h1 - 1 + 1) + ', ', 
-                          str(i2 + 1) + '-' + str(h2 - 1 + 1))
-                    
-                    # Get data
-                    data = {}
-
-                    if opts.net == 'mtl':
-                        data['img'] = img[:, :, i1:h1, i2:h2]
-                        data['meq'] = torch.empty(0)
-                    
-                    if opts.net == 'mtl-seismicity':
-                        x1 = img[:, :, i1:h1, i2:h2]
-                        x2 = meq[:, :, i1:h1, i2:h2]
-                        data['img'] = torch.cat((x1, x2), dim=0)
-                        data['meq'] = torch.empty(0)
-                    
-                    if opts.net == 'scf':
-                        data['img'] = img[:, :, i1:h1, i2:h2]
-                        data['meq'] = meq[:, :, i1:h1, i2:h2]
-                    
-                    if opts.net == 'scf-elastic':
-                        if opts.pp:
-                            pp = pp[:, :, i1:h1, i2:h2]
-                        if opts.ps:
-                            ps = ps[:, :, i1:h1, i2:h2]
-                        if opts.sp:
-                            sp = sp[:, :, i1:h1, i2:h2]
-                        if opts.ss:
-                            ss = ss[:, :, i1:h1, i2:h2]
-                        data['img'] = torch.cat([t for t in [pp, ps, sp, ss] if t is not None], dim=1)
-                        data['meq'] = meq[:, :, i1:h1, i2:h2]
-                        
-                    data['img'] = data['img'].to(device)
-                    data['meq'] = data['meq'].to(device)
-
-                    # Inference for this block
-                    with torch.no_grad():
-                        with torch.autocast(device_type=device.type, dtype=torch.float16):
-                            predict_block = net(data)
-
-                    # Merge to whole
-                    predict['fsem'] = merge_block_2d(predict['fsem'], 
-                                                     taper_2d_bc(predict_block['fsem'].to('cpu'), [1, 1, 1, 1], method='zero'), 
-                                                     range=(i1, h1, i2, h2), 
-                                                     mode='signed_max')
-                    predict['fdip'] = merge_block_2d(predict['fdip'], 
-                                                     taper_2d_bc(predict_block['fdip'].to('cpu'), [1, 1, 1, 1], method='zero'), 
-                                                     range=(i1, h1, i2, h2), 
-                                                     mode='signed_max')
-
-        ## Output inference results
-        write_array(get_numpy(predict['fsem']), opts.output + '.fsem')
-        write_array(get_numpy(predict['fdip']), opts.output + '.fdip')
+        for mode in (MODES if opts.mode == 'all' else [opts.mode]):
+            x = {'img': torch.zeros_like(img) if mode == 'meq' else img, 'meq': torch.zeros_like(meq) if mode == 'image' else meq}
+            out = predict(net, x, block=(opts.b1, opts.b2), overlap=(opts.p1, opts.p2))
+            prefix = opts.output + ('.' + mode if opts.mode == 'all' else '')
+            for k in ['fsem', 'fdip']:
+                write_array(get_numpy(out[k]), prefix + '.' + k)
+            print(date_time(), ' >> %s: %s.fsem, .fdip' % (TITLES[mode], prefix))
 
         print(date_time(), ' >> Inference finished')

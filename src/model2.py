@@ -1,5 +1,5 @@
 #
-# (c) 2025. Triad National Security, LLC. All rights reserved.
+# (c) 2025-2026. Triad National Security, LLC. All rights reserved.
 #
 # This program was produced under U.S. Government contract 89233218CNA000001
 # for Los Alamos National Laboratory (LANL), which is operated by
@@ -8,12 +8,16 @@
 # by Triad National Security, LLC, and the U.S. Department of Energy/
 # National Nuclear Security Administration.
 # The Government is granted for itself and others acting on its behalf a nonexclusive,
-# paid-up, irrevocable worldwide license in this material to reproduce, prepare,
+# paid-up, irrevocable worldwide license in this material to reproduce, prepare
 # derivative works, distribute copies to the public, perform publicly
 # and display publicly, and to permit others to do so.
 #
 # Author:
 #   Kai Gao, kaigao@lanl.gov
+#
+# Building blocks of SCF-Net in 2D. Batch normalization uses fixed running statistics at inference, and the
+# modal fusion is local, so the output at a pixel depends only on the image and the seismicity around it, and
+# not on the size or the content of the whole image.
 #
 
 import torch
@@ -21,13 +25,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def upsample_like(src, tar, mode='bilinear'):
+def upsample_like(src, tar):
 
-    if mode == 'bilinear':
-        src = F.interpolate(src, size=tar.shape[2:], mode='bilinear', align_corners=False)
-    else:
-        src = F.interpolate(src, size=tar.shape[2:], mode='nearest')
-    return src
+    return F.interpolate(src, size=tar.shape[2:], mode='bilinear', align_corners=False)
 
 
 def pad_like(source, target):
@@ -43,74 +43,29 @@ def maxpool(l, kernel_size=2):
     return F.max_pool2d(l, kernel_size=kernel_size)
 
 
-def upsample(l, scale_factor=2, mode='bilinear'):
-
-    if mode == 'bilinear':
-        return F.upsample(l, scale_factor=scale_factor, mode='bilinear', align_corners=False)
-    else:
-        return F.upsample(l, scale_factor=scale_factor, mode='nearest')
-
-
-def taper(x, width, apply):
-
-    n1, n2 = x.shape
-
-    if apply[0]:
-        for i in range(0, width[0]):
-            x[i, :] = x[i, :] * i * 1.0 / width[0]
-    if apply[1]:
-        for i in range(0, width[1]):
-            x[n1 - 1 - i, :] = x[n1 - 1 - i, :] * i * 1.0 / width[1]
-
-    if apply[2]:
-        for i in range(0, width[2]):
-            x[:, i] = x[:, i] * i * 1.0 / width[2]
-    if apply[3]:
-        for i in range(0, width[3]):
-            x[:, n2 - 1 - i] = x[:, n2 - 1 - i] * i * 1.0 / width[3]
-
-    return x
-
-
 class conv(nn.Module):
+    """Convolution, batch normalization (if bn) and activation ('relu', 'sigmoid' or None)."""
 
-    def __init__(self,
-                 in_channels,
-                 out_channels,
-                 kernel_size=3,
-                 dilation=1,
-                 activation='relu',
-                 bn=True,
-                 bn_type='instance'):
+    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, activation='relu', bn=True):
 
         super(conv, self).__init__()
 
-        layers = []
-        layers.append(nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, dilation=dilation, padding='same'))
-
+        layers = [nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, dilation=dilation, padding='same')]
         if bn:
-            if bn_type == 'batch':
-                layers.append(nn.BatchNorm2d(out_channels))
-            elif bn_type == 'instance':
-                layers.append(nn.InstanceNorm2d(out_channels))
-            else:
-                layers.append(nn.InstanceNorm2d(out_channels))
-
+            layers.append(nn.BatchNorm2d(out_channels))
         if activation == 'relu':
             layers.append(nn.ReLU(inplace=True))
-        elif activation == 'leaky_relu':
-            layers.append(nn.LeakyReLU(inplace=True))
         elif activation == 'sigmoid':
             layers.append(nn.Sigmoid())
-        elif activation == 'softmax':
-            layers.append(nn.Softmax())
-        elif activation == 'tanh':
-            layers.append(nn.Tanh())
 
         self.c = nn.Sequential(*layers)
 
     def forward(self, x):
 
+        # A sigmoid output is computed in float32, so that under mixed precision a probability near 0 or 1 keeps
+        # its gradient (in bfloat16, sigmoid(x) rounds to 1 for x >= 7, and its gradient vanishes)
+        if isinstance(self.c[-1], nn.Sigmoid):
+            return self.c[-1](self.c[:-1](x).float())
         return self.c(x)
 
 
@@ -209,6 +164,7 @@ class resu2(nn.Module):
 
 
 class resu3(nn.Module):
+    """Bottleneck block with dilated convolutions (dilations 2, 4 and 8)."""
 
     def __init__(self, in_channels=1, out_channels=1):
 
@@ -242,10 +198,12 @@ class resu3(nn.Module):
         up = up + conv0
 
         return up
-    
-    
+
+
 class SpatialAttention(nn.Module):
+
     def __init__(self, in_channels, kernel_size=7):
+
         super(SpatialAttention, self).__init__()
 
         assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
@@ -255,103 +213,67 @@ class SpatialAttention(nn.Module):
         self.convout = nn.Conv2d(3, 1, kernel_size=kernel_size, padding=padding, bias=False)
 
     def forward(self, x):
+
         avg_out = torch.mean(x, dim=1, keepdim=True)
         max_out, _ = torch.max(x, dim=1, keepdim=True)
         x = self.conv(x)
         x = torch.cat((avg_out, max_out, x), dim=1)
 
-        out = self.convout(x)
-        return out
+        return self.convout(x)
 
 
-class ChannelAttention(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(ChannelAttention, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
+class LocalSpatialChannelAttention(nn.Module):
+    """
+    Modal fusion of the image features e1 and the seismicity features e2 by a spatial-channel attention that is
+    local and residual: the channel attention is computed at every pixel with 1 x 1 convolutions, so the fused
+    features at a pixel depend only on the encoder features around that pixel, and the attention a in [0, 1]
+    scales the features by 1 + a, so it can emphasize features but cannot remove the image features where
+    there is no seismicity.
+    """
 
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
-
-    def forward(self, x):
-        avg_out = self.avg_pool(x)
-        max_out = self.max_pool(x)
-
-        out = self.conv(avg_out) + self.conv(max_out)
-        return out
-
-class SpatialChannelAttention(nn.Module):
-    
     def __init__(self, in_channels_encoder, out_channels, channel_ratio=16, spatial_kernel=7):
-        super(SpatialChannelAttention, self).__init__()
+
+        super(LocalSpatialChannelAttention, self).__init__()
 
         self.sa_encoder1 = SpatialAttention(in_channels_encoder[0], spatial_kernel)
         self.sa_encoder2 = SpatialAttention(in_channels_encoder[1], spatial_kernel)
-        
+
         self.n = max(in_channels_encoder) // channel_ratio
-        self.ca_encoder1 = ChannelAttention(in_channels_encoder[0], self.n)
-        self.ca_encoder2 = ChannelAttention(in_channels_encoder[1], self.n)
-                
+        self.ca_encoder1 = nn.Conv2d(in_channels_encoder[0], self.n, kernel_size=1, bias=False)
+        self.ca_encoder2 = nn.Conv2d(in_channels_encoder[1], self.n, kernel_size=1, bias=False)
+
         self.cconv = nn.Conv2d(self.n, out_channels, kernel_size=1, bias=False)
 
     def forward(self, e1, e2):
-               
-        sag = self.sa_encoder1(e1) + self.sa_encoder2(e2)
-        cag = self.ca_encoder1(e1) + self.ca_encoder2(e2)
 
-        sag = F.sigmoid(sag)
-        cag = F.sigmoid(self.cconv(cag))
+        sag = torch.sigmoid(self.sa_encoder1(e1) + self.sa_encoder2(e2))
+        cag = torch.sigmoid(self.cconv(F.relu(self.ca_encoder1(e1) + self.ca_encoder2(e2))))
 
-        s = e1.shape
-        c, h, w = s[1:]
-        c = c*2
-        sag = sag.repeat(1, c, 1, 1)
-        cag = cag.repeat(1, 1, h, w)
-        out = torch.cat((e1, e2), dim=1) * sag * cag
-
-        return out
+        return torch.cat((e1, e2), dim=1) * (1.0 + sag * cag)
 
 
-## Decoder -- with multimodal fusion
 class mtl_decoder_fusion(nn.Module):
+    """Decoder that fuses the image and seismicity encoder features at the two finest levels."""
 
-    def __init__(self, l1, l2, l3, out_ch=1, bn=None, out_activation=None, last_kernel_size=1):
+    def __init__(self, l1, l2, l3, out_ch=1, last_kernel_size=1):
 
         super(mtl_decoder_fusion, self).__init__()
 
         self.out_ch = out_ch
-        self.out_activation = out_activation
         self.last_kernel_size = last_kernel_size
         self.l1 = l1
         self.l2 = l2
         self.l3 = l3
-        self.bn = bn
 
         self.decoder2 = resu2(2 * self.l2 + self.l3, self.l2)
         self.decoder1 = resu1(2 * self.l1 + self.l2, self.l1)
 
-        layers = []
-        layers.append(nn.Conv2d(self.l1, self.l1, 3, padding='same'))
-        layers.append(nn.Conv2d(self.l1, self.l1, 3, padding='same'))
-        layers.append(nn.Conv2d(self.l1, self.out_ch, self.last_kernel_size, padding='same'))
+        self.out = nn.Sequential(nn.Conv2d(self.l1, self.l1, 3, padding='same'),
+                                 nn.Conv2d(self.l1, self.l1, 3, padding='same'),
+                                 nn.Conv2d(self.l1, self.out_ch, self.last_kernel_size, padding='same'))
 
-        if self.bn == 'batch':
-            layers.append(nn.BatchNorm2d(self.out_ch))
-        elif self.bn == 'instance':
-            layers.append(nn.InstanceNorm2d(self.out_ch))
-
-        if self.out_activation == 'relu':
-            layers.append(nn.ReLU(inplace=True))
-        elif self.out_activation == 'softmax':
-            layers.append(nn.Softmax())
-        elif self.out_activation == 'sigmoid':
-            layers.append(nn.Sigmoid())
-        elif self.out_activation == 'tanh':
-            layers.append(nn.Tanh())
-
-        self.out = nn.Sequential(*layers)
-        
-        self.fusion2 = SpatialChannelAttention((self.l2, self.l2), 2*self.l2, channel_ratio=8)
-        self.fusion1 = SpatialChannelAttention((self.l1, self.l1), 2*self.l1, channel_ratio=8)
+        self.fusion2 = LocalSpatialChannelAttention((self.l2, self.l2), 2 * self.l2, channel_ratio=8)
+        self.fusion1 = LocalSpatialChannelAttention((self.l1, self.l1), 2 * self.l1, channel_ratio=8)
 
     def forward(self, x, out_encoder1_a, out_encoder2_a, out_encoder1_b, out_encoder2_b, l):
 
@@ -363,64 +285,11 @@ class mtl_decoder_fusion(nn.Module):
         f1 = self.fusion1(out_encoder1_a, out_encoder1_b)
         up2 = self.decoder1(torch.cat((up2, f1), dim=1))
 
-        out = upsample_like(self.out(up2), x)
+        return upsample_like(self.out(up2), x)
 
-        return out
-
-
-## Decoder -- without multimodal fusion
-class mtl_decoder_nofusion(nn.Module):
-
-    def __init__(self, l1, l2, l3, out_ch=1, bn=None, out_activation=None, last_kernel_size=1):
-
-        super(mtl_decoder_nofusion, self).__init__()
-
-        self.out_ch = out_ch
-        self.out_activation = out_activation
-        self.last_kernel_size = last_kernel_size
-        self.l1 = l1
-        self.l2 = l2
-        self.l3 = l3
-        self.bn = bn
-
-        self.decoder2 = resu2(self.l2 + self.l3, self.l2)
-        self.decoder1 = resu1(self.l1 + self.l2, self.l1)
-
-        layers = []
-        layers.append(nn.Conv2d(self.l1, self.l1, 3, padding='same'))
-        layers.append(nn.Conv2d(self.l1, self.l1, 3, padding='same'))
-        layers.append(nn.Conv2d(self.l1, self.out_ch, self.last_kernel_size, padding='same'))
-
-        if self.bn == 'batch':
-            layers.append(nn.BatchNorm2d(self.out_ch))
-        elif self.bn == 'instance':
-            layers.append(nn.InstanceNorm2d(self.out_ch))
-
-        if self.out_activation == 'relu':
-            layers.append(nn.ReLU(inplace=True))
-        elif self.out_activation == 'softmax':
-            layers.append(nn.Softmax())
-        elif self.out_activation == 'sigmoid':
-            layers.append(nn.Sigmoid())
-        elif self.out_activation == 'tanh':
-            layers.append(nn.Tanh())
-
-        self.out = nn.Sequential(*layers)
-
-    def forward(self, x, out_encoder1, out_encoder2, l):
-
-        up3 = upsample_like(l, out_encoder2)
-        up3 = self.decoder2(torch.cat((up3, out_encoder2), dim=1))
-
-        up2 = upsample_like(up3, out_encoder1)
-        up2 = self.decoder1(torch.cat((up2, out_encoder1), dim=1))
-
-        out = upsample_like(self.out(up2), x)
-
-        return out
-    
 
 class mtl_subdecoder(nn.Module):
+    """Output head: four residual convolutions and an output convolution with an activation."""
 
     def __init__(self, in_ch, out_ch=1, bn=False, mid_activation=None, activation=None):
 
@@ -428,18 +297,13 @@ class mtl_subdecoder(nn.Module):
 
         self.in_ch = in_ch
         self.out_ch = out_ch
-        self.activation = activation
-        self.bn = bn
-        self.mid_activation = mid_activation
 
-        self.conv = nn.Sequential(conv(self.in_ch, 2 * self.in_ch, activation=self.mid_activation, bn=self.bn),
-                                  conv(2 * self.in_ch, 2 * self.in_ch, activation=self.mid_activation, bn=self.bn),
-                                  conv(2 * self.in_ch, 2 * self.in_ch, activation=self.mid_activation, bn=self.bn),
-                                  conv(2 * self.in_ch, self.in_ch, activation=self.mid_activation, bn=self.bn))
-        self.out = nn.Sequential(conv(self.in_ch, 1, activation=self.activation, bn=False))
+        self.conv = nn.Sequential(conv(self.in_ch, 2 * self.in_ch, activation=mid_activation, bn=bn),
+                                  conv(2 * self.in_ch, 2 * self.in_ch, activation=mid_activation, bn=bn),
+                                  conv(2 * self.in_ch, 2 * self.in_ch, activation=mid_activation, bn=bn),
+                                  conv(2 * self.in_ch, self.in_ch, activation=mid_activation, bn=bn))
+        self.out = nn.Sequential(conv(self.in_ch, self.out_ch, activation=activation, bn=False))
 
     def forward(self, x):
 
-        out = self.out(x + self.conv(x))
-
-        return out
+        return self.out(x + self.conv(x))
