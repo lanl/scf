@@ -25,6 +25,8 @@ bash run_valid.sh
 
 The `test` directories in `2d` and `3d` contain field data examples.
 
+To reproduce the results in the published paper, please use release v1.0.0. 
+
 # License
 &copy; 2024-2026. Triad National Security, LLC. All rights reserved.
 
