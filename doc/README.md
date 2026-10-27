@@ -17,7 +17,7 @@ The data generation runs on several MPI processes with `mpirun -np <n> python ge
 | `--p_image`, `--p_meq` | `0.3`, `0.2` | shares of the training samples with the image only and with the seismicity only |
 | `--crop1`, `--crop2`, `--crop3` | 128 (2D), 64 (3D) | smallest random training crop along every axis |
 | `--crop_max` | sample size | largest random training crop along every axis, to fit the GPU memory |
-| `--w_dip`, `--w_consist` | `1`, `1` | weights of the dip (and strike) loss and of the patch-consistency loss |
+| `--w_bce`, `--w_dip`, `--w_consist` | `1`, `1`, `1` | weights of the cross entropy of the fault probability (added to its Dice loss; a smaller weight gives fewer low-probability pixels), of the dip (and strike) loss, and of the patch-consistency loss (it needs `--w_bce` > 0) |
 | `--epochs`, `--warmup`, `--lr`, `--bn_freeze` | `60`, `5`, `2e-4`, `6` | epochs, warmup epochs, learning rate, and final epochs with fixed batch-normalization statistics |
 | `--gpus_per_node`, `--nodes`, `--precision` | `1`, `1`, `32` | GPUs per node, nodes, and precision of training (`bf16-mixed` needs GPUs with bfloat16, e.g., A100 or H100) |
 | `--finetune`, `--resume` | | checkpoint that initializes the network, or from which the training resumes |
@@ -37,4 +37,4 @@ python src/main2.py --model=2d/result/last.ckpt --input=image.bin --input_meq=im
     --n1=256 --n2=1024 --mode=all --b1=256 --b2=256 --p1=64 --p2=64 --output=predict
 ```
 
-writes `predict.image.fsem`, `predict.both.fsem`, and `predict.meq.fsem` (fault probability) and the corresponding `.fdip` files (fault dip divided by 180 degrees, times the fault probability); in 3D, `src/main3.py` also writes `.fstrike` files. The image is normalized by its RMS once, the blocks start on the pooling grid of the network and are blended with a raised-cosine taper, and the image stays in the CPU memory while every block goes to the GPU, so a large volume gives the same faults as whole-volume inference.
+writes `predict.image.fsem`, `predict.both.fsem`, and `predict.meq.fsem` (fault probability) and the corresponding `.fdip` files (fault dip divided by 180 degrees where the fault probability exceeds `--fault_threshold`, 0.5 by default, zero elsewhere: the dip is learned on the true faults only, and a product with the probability would turn an uncertain sample into a wrong, smaller dip); in 3D, `src/main3.py` also writes `.fstrike` files, masked the same way. The image is normalized by its RMS once, the blocks start on the pooling grid of the network and are blended with a raised-cosine taper, and the image stays in the CPU memory while every block goes to the GPU, so a large volume gives the same faults as whole-volume inference.

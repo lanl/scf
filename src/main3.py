@@ -100,7 +100,12 @@ parser.add_argument('--meq_blur', type=float, nargs=2, default=[0.0, 1.5],
                     help='range of the standard deviation (voxels) of the random blur of the seismicity of half of the training samples')
 # Loss
 parser.add_argument('--w_dip', type=float, default=1.0, help='weight of the dip and strike losses')
-parser.add_argument('--w_consist', type=float, default=1.0, help='weight of the patch-consistency loss')
+parser.add_argument('--w_bce', type=float, default=1.0,
+                    help='weight of the binary cross entropy of the fault probability, added to its Dice loss; a smaller weight '
+                    'gives fewer low-probability pixels, and the patch-consistency loss needs a positive weight')
+parser.add_argument('--w_consist', type=float, default=1.0,
+                    help='weight of the patch-consistency loss; it needs the cross entropy (--w_bce > 0), without which it '
+                    'drives the faults to a constant')
 # Validation
 parser.add_argument('--check', type=str, default=None, help='checkpoint to validate on the validation set')
 parser.add_argument('--tol', type=int, default=2, help='distance tolerance of the fault metrics (voxels)')
@@ -112,6 +117,8 @@ parser.add_argument('--input_meq', type=str, default=None, help='seismicity loca
 parser.add_argument('--input_events', type=str, default=None,
                     help='event locations instead of --input_meq: a text file of x1, x2 and x3 grid coordinates (from 0)')
 parser.add_argument('--output', type=str, default=None, help='prefix of the outputs <output>[.<mode>].fsem, .fdip and .fstrike')
+parser.add_argument('--fault_threshold', type=float, default=0.5,
+                    help='fault probability above which the dip and strike outputs hold the predicted dip and strike; zero elsewhere')
 parser.add_argument('--mode', type=str, default='all', choices=['all', 'both', 'image', 'meq'],
                     help='input mode: image and seismicity, image only, seismicity only, or all three')
 parser.add_argument('--b1', type=int, default=0, help='block size along x1 (0: the whole axis)')
@@ -127,6 +134,10 @@ opts = parser.parse_args()
 
 assert min(opts.n1, opts.n2, opts.n3) >= 1
 assert 0 <= opts.p_image + opts.p_meq <= 1
+assert opts.w_bce >= 0
+if opts.model is None and opts.check is None:
+    assert opts.w_bce > 0 or opts.w_consist == 0, \
+        'the patch-consistency loss (--w_consist) needs the cross entropy (--w_bce > 0): without it, the faults collapse to a constant'
 
 use_gpu = opts.accelerator != 'cpu' and torch.cuda.is_available() and opts.gpus_per_node >= 1
 if opts.accelerator == 'gpu' and not use_gpu:
@@ -170,10 +181,12 @@ class BasicDataset(Dataset):
 
 
 def custom_loss(y_pred, y_true):
-    """Dice and binary cross entropy of the fault probability, and L1 of the dip and strike on the true faults."""
+    """Dice loss and binary cross entropy (weight --w_bce) of the fault probability, and L1 of the dip and strike on the true faults."""
 
     mt = y_true['fsem']
-    loss_fsem = dice_loss(y_pred['fsem'], mt) + bce_loss(y_pred['fsem'], mt)
+    loss_fsem = dice_loss(y_pred['fsem'], mt)
+    if opts.w_bce > 0:
+        loss_fsem = loss_fsem + opts.w_bce * bce_loss(y_pred['fsem'], mt)
     loss_fdip = masked_l1(y_pred['fdip_raw'], y_true['fdip'], mt) * opts.w_dip
     loss_fstrike = masked_l1(y_pred['fstrike_raw'], y_true['fstrike'], mt) * opts.w_dip
 
@@ -217,12 +230,13 @@ class mtlnet(pl.LightningModule):
         e3 = self.encoder3(self.fusion3(maxpool(e2_img, 2), maxpool(e2_meq, 2)))
         f = self.decoder(x['img'], e1_img, e2_img, e1_meq, e2_meq, e3)
 
-        # The dip and the strike are learned on the faults only (fdip_raw, fstrike_raw), and the output dip and
-        # strike are masked by the fault probability
+        # The dip and the strike are learned on the faults only (fdip_raw, fstrike_raw), and the outputs are the raw dip and
+        # strike where the fault probability exceeds the threshold, zero elsewhere
         out = {'fsem': self.subdecoder_fault_semantic(f), 'fdip_raw': self.subdecoder_fault_dip(f),
                'fstrike_raw': self.subdecoder_fault_strike(f)}
-        out['fdip'] = out['fdip_raw'] * out['fsem']
-        out['fstrike'] = out['fstrike_raw'] * out['fsem']
+        on = (out['fsem'] > opts.fault_threshold).to(out['fdip_raw'].dtype)
+        out['fdip'] = out['fdip_raw'] * on
+        out['fstrike'] = out['fstrike_raw'] * on
 
         return out
 
@@ -331,8 +345,9 @@ def predict(net, data, block=(0, 0, 0), overlap=(0, 0, 0)):
         return {k: out[k].float() for k in ['fsem', 'fdip_raw', 'fstrike_raw']}
 
     out = predict_blocks(fn, data, block, overlap, device=device)
-    out['fdip'] = out['fdip_raw'] * out['fsem']
-    out['fstrike'] = out['fstrike_raw'] * out['fsem']
+    on = (out['fsem'] > opts.fault_threshold).to(out['fdip_raw'].dtype)
+    out['fdip'] = out['fdip_raw'] * on
+    out['fstrike'] = out['fstrike_raw'] * on
 
     return out
 
