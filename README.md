@@ -13,15 +13,16 @@ The work is under LANL open source approval reference O4809.
 `SCF` requires PyTorch, Lightning, TensorBoard, NumPy, SciPy, matplotlib, and tqdm. The data generation requires the Python interface of [RGM](https://github.com/lanl/rgm), which depends on [FLIT](https://github.com/lanl/flit), and mpi4py to run on several MPI processes. Import `rgm` before `torch` in your own scripts: with `torch` imported first, RGM returns images of NaN values.
 
 # Use
-The directories `2d` and `3d` contain the data generation (`generate_data.py`), a training script, and a validation script:
+The directories `2d` and `3d` contain the data generation (`generate_data.py`), a training script, a validation script, and a script that extracts fault surfaces:
 
 ```
 cd 2d        # or 3d
 bash run_train.sh
 bash run_valid.sh
+bash run_surfaces.sh
 ```
 
-`run_train.sh` generates the training and validation data on several MPI processes and trains the network on one or several GPUs; the variables at the top of the script set the numbers of samples, processes, and GPUs. `run_valid.sh` compares the three input modes: it writes the precision, recall, F1 score, and dip (and strike) errors of every mode on the validation set (`metrics_validation.txt` and `.png`), figures of validation samples, the agreement of block-wise and whole-image inference, and the faults of a field example from every mode (the Opunake image in 2D and the F3 volume in 3D). [doc/README.md](doc/README.md) describes the data format, the options, and inference on large images and volumes.
+`run_train.sh` generates the training and validation data on several MPI processes and trains the network on one or several GPUs; the variables at the top of the script set the numbers of samples, processes, and GPUs. `run_valid.sh` compares the three input modes: it writes the precision, recall, F1 score, and dip (and strike) errors of every mode on the validation set (`metrics_validation.txt` and `.png`), figures of validation samples, the agreement of block-wise and whole-image inference, and the faults of a field example from every mode (the Opunake image in 2D and the F3 volume in 3D). `run_surfaces.sh` extracts discrete faults (polylines in 2D, triangulated surfaces in 3D) from the field example, for display in ParaView; its variables set the parameters of the extraction, grouped by the property of the faults that they control. [doc/README.md](doc/README.md) describes the data format, the options, and inference on large images and volumes.
 
 The `test` directories in `2d` and `3d` contain field data examples.
 

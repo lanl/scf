@@ -18,6 +18,7 @@
 # Seismicity location images for SCF-Net in 2D and 3D (numpy and scipy only, so that a data generator
 # can use it without importing torch, which corrupts the RGM images when imported before RGM):
 #
+#   read_events           event locations (and attributes) from a text or CSV file
 #   render_seismicity     seismicity location image of event coordinates (Eq. 13 of Gao and Chen, 2025)
 #   simulate_seismicity   random seismicity of a fault model, with inactive faults, patchy and
 #                         clustered activity along faults, location errors, seismicity confined to
@@ -26,8 +27,43 @@
 #                         seismicity-only mode)
 #
 
+import csv
+import shlex
+
 import numpy as np
 from scipy import ndimage
+
+
+def read_events(filename, ndim):
+    """
+    Event locations from a text file with one event per line, its columns separated by commas (CSV) or white space:
+    the x1 (depth), x2[ and x3] grid coordinates (from 0) in the first ndim columns, and attributes of the events (e.g.,
+    the magnitude) in further columns. A first line that is not numeric names the columns; lines starting with # are
+    comments. Returns the coordinates (nevent, ndim) and the attributes, named after the first line or column<k> (k
+    from 1).
+    """
+
+    with open(filename) as f:
+        lines = f.read().splitlines()
+    first = next(i for i, l in enumerate(lines) if l.strip() and not l.lstrip().startswith('#'))
+    sep = ',' if ',' in lines[first] else None
+    try:
+        tokens = next(csv.reader([lines[first]])) if sep else shlex.split(lines[first])
+    except ValueError:
+        tokens = lines[first].split(sep)
+    tokens = [t.strip() for t in tokens]
+    try:
+        [float(t) for t in tokens]
+        names, skip = None, 0
+    except ValueError:
+        names, skip = tokens, first + 1
+    data = np.loadtxt(filename, delimiter=sep, skiprows=skip, comments='#', ndmin=2)
+    assert data.shape[1] >= ndim, '%s: the first %d columns must be the grid coordinates of the events' % (filename, ndim)
+    attrs = {}
+    for k in range(ndim, data.shape[1]):
+        name = names[k] if names is not None and k < len(names) and names[k] else 'column%d' % (k + 1)
+        attrs[''.join(c if c.isalnum() else '_' for c in name)] = data[:, k]
+    return data[:, :ndim], attrs
 
 
 def render_seismicity_nd(x, shape, a=0.3, radius=4, chunk=2000):

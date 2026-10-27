@@ -53,7 +53,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from utility import read_array, write_array, set_random_seed, get_numpy, date_time, set_font
 from scf_common import (estimate_scale, agc, apply_mode, CropCollate, random_subcrop, dice_loss, bce_loss, kl_loss,
                         masked_l1, dilate, fault_scores, predict_blocks)
-from seismicity import render_seismicity
+from seismicity import read_events, render_seismicity
 from model2 import resu1, resu2, resu3, maxpool, LocalSpatialChannelAttention, mtl_decoder_fusion, mtl_subdecoder
 
 # ==============================================================================
@@ -111,7 +111,8 @@ parser.add_argument('--model', type=str, default=None, help='checkpoint for infe
 parser.add_argument('--input', type=str, default=None, help='image (raw float32, x1 fastest); zero if not given')
 parser.add_argument('--input_meq', type=str, default=None, help='seismicity location image (raw float32); zero if not given')
 parser.add_argument('--input_events', type=str, default=None,
-                    help='event locations instead of --input_meq: a text file of x1 and x2 grid coordinates (from 0)')
+                    help='event locations instead of --input_meq: a text or CSV file with x1 and x2 grid coordinates '
+                    '(from 0) in its first columns')
 parser.add_argument('--output', type=str, default=None, help='prefix of the outputs <output>[.<mode>].fsem and .fdip')
 parser.add_argument('--fault_threshold', type=float, default=0.5,
                     help='fault probability above which the dip output holds the predicted dip; zero elsewhere')
@@ -528,7 +529,7 @@ if __name__ == '__main__':
         # The image stays in the CPU memory, and only the blocks go to the GPU
         img = read_array(opts.input, shape) if opts.input is not None else torch.zeros(shape)
         if opts.input_events is not None:
-            ev = np.loadtxt(opts.input_events, ndmin=2)
+            ev = read_events(opts.input_events, 2)[0]
             meq = torch.from_numpy(render_seismicity(ev[:, 0], ev[:, 1], (n1, n2)))[None, None]
         elif opts.input_meq is not None:
             meq = read_array(opts.input_meq, shape).clamp(0, 1)

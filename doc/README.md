@@ -22,7 +22,7 @@ The data generation runs on several MPI processes with `mpirun -np <n> python ge
 | `--gpus_per_node`, `--nodes`, `--precision` | `1`, `1`, `32` | GPUs per node, nodes, and precision of training (`bf16-mixed` needs GPUs with bfloat16, e.g., A100 or H100) |
 | `--finetune`, `--resume` | | checkpoint that initializes the network, or from which the training resumes |
 | `--mode` | `all` | inference from the `image` only, the seismicity only (`meq`), `both`, or `all` three |
-| `--input`, `--input_meq`, `--input_events` | | image, seismicity location image, or event locations (a text file of grid coordinates); either input can be missing |
+| `--input`, `--input_meq`, `--input_events` | | image, seismicity location image, or event locations (a text or CSV file with the grid coordinates in its first columns); either input can be missing |
 | `--b1`, `--b2`, `--b3`, `--p1`, `--p2`, `--p3` | whole image, 64 (2D), 32 (3D) | block sizes and overlaps of block-wise inference |
 | `--scale` | `rms` | amplitude normalization of the image: `rms` of the whole image, or `agc` (local) |
 
@@ -38,3 +38,14 @@ python src/main2.py --model=2d/result/last.ckpt --input=image.bin --input_meq=im
 ```
 
 writes `predict.image.fsem`, `predict.both.fsem`, and `predict.meq.fsem` (fault probability) and the corresponding `.fdip` files (fault dip divided by 180 degrees where the fault probability exceeds `--fault_threshold`, 0.5 by default, zero elsewhere: the dip is learned on the true faults only, and a product with the probability would turn an uncertain sample into a wrong, smaller dip); in 3D, `src/main3.py` also writes `.fstrike` files, masked the same way. The image is normalized by its RMS once, the blocks start on the pooling grid of the network and are blended with a raised-cosine taper, and the image stays in the CPU memory while every block goes to the GPU, so a large volume gives the same faults as whole-volume inference.
+
+## Fault surfaces
+
+`src/fault_surfaces.py` (run by `run_surfaces.sh` on the field example) turns the outputs of an inference into discrete faults: polylines in 2D and triangulated surfaces in 3D. It thins the fault probability to fault cells along the predicted fault normal, links neighboring cells with similar orientations into faults, and merges pieces of a fault across gaps of up to `--max_gap` samples (Hale, 2013). Optimal surface voting (`--vote`; Wu and Fomel, 2018) suits a noisy fault probability. Run the inference with `--fault_threshold=0`, so that the dip and strike are written wherever cells may form. For example, in 3D,
+
+```
+python src/fault_surfaces.py --fsem=predict.image.fsem --fdip=predict.image.fdip --fstrike=predict.image.fstrike \
+    --n1=128 --n2=256 --n3=256 --image=image.bin --color=dip --output=predict.image
+```
+
+writes `predict.image.faults.vtk` (the faults as VTK polydata with the attributes fault, probability, dip, and strike, for ParaView or pyvista), `.faults.txt` (the cells of the faults), `.faults.json` (a summary of every fault), `.faults` (the fault index on the grid), and `.faults.png` (the faults with the image, colored by `--color`). With `--h5`, it also writes `.faults.h5`, the faults in HDF5: the number of vertices `nvertex`, their coordinates `x1`, `x2`, `x3` in samples, their attributes, and the number of triangles `ntriangle` and their vertices `triangles` (0-based indices; in 2D, the segments of the polylines). With `--events` (event locations, as given to the inference with `--input_events`; further columns, such as the magnitude, are attributes of the events) or `--meq` (whose maxima give the events), it writes `.events.vtk`, the events as balls colored by the first attribute. With `--volume`, it writes `.volume.vti`, the image, the seismicity location image, and the fault probability, dip, and strike as a VTK image. All VTK files share one frame, so ParaView displays them together. Both VTK files place a sample (x1, x2, x3) at (x2, x3, -x1), so that depth points down; the strike is the azimuth when x2 points east and x3 north. The main controls are `--max_gap` (continuity), `--min_cells` (smallest fault), `--lower` and `--upper` (least probability of a cell, and of the most confident cell of a fault), `--smooth_surface` (radius of the local plane fits that smooth the faults, 4 samples), and `--max_hole` (largest hole in a 3D fault surface that is filled, 50 square samples).
